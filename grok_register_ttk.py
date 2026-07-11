@@ -2480,6 +2480,7 @@ def getTurnstileToken(log_callback=None, cancel_callback=None):
     if page is None:
         raise Exception("页面未就绪，无法执行 Turnstile")
 
+    # Soft reset only once; repeated reset can prevent token settle
     try:
         page.run_js(
             "try { if (window.turnstile && typeof turnstile.reset === 'function') turnstile.reset(); } catch(e) {}"
@@ -2487,7 +2488,25 @@ def getTurnstileToken(log_callback=None, cancel_callback=None):
     except Exception:
         pass
 
-    for _ in range(0, 20):
+    # Simulate human activity before interacting with Turnstile
+    try:
+        page.run_js(
+            """
+try {
+  const sx = 800 + Math.floor(Math.random()*400);
+  const sy = 400 + Math.floor(Math.random()*300);
+  Object.defineProperty(MouseEvent.prototype, 'screenX', { get: () => sx, configurable: true });
+  Object.defineProperty(MouseEvent.prototype, 'screenY', { get: () => sy, configurable: true });
+  window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: sx/2, clientY: sy/2 }));
+  document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: sx/2+10, clientY: sy/2+8 }));
+} catch(e) {}
+            """
+        )
+        page.actions.move_to(x=420, y=360).move(30, 20)
+    except Exception:
+        pass
+
+    for attempt in range(0, 35):
         raise_if_cancelled(cancel_callback)
         try:
             token = page.run_js(
@@ -2495,6 +2514,11 @@ def getTurnstileToken(log_callback=None, cancel_callback=None):
 try {
   const byInput = String((document.querySelector('input[name="cf-turnstile-response"]') || {}).value || '').trim();
   if (byInput) return byInput;
+  const inputs = Array.from(document.querySelectorAll('input[name*="turnstile" i], textarea[name*="turnstile" i], input[name="cf-turnstile-response"]'));
+  for (const el of inputs) {
+    const v = String(el.value || '').trim();
+    if (v.length >= 80) return v;
+  }
   if (window.turnstile && typeof turnstile.getResponse === 'function') {
     return String(turnstile.getResponse() || '').trim();
   }
@@ -2508,7 +2532,24 @@ try {
                     log_callback(f"[*] Turnstile 已通过，token长度={len(token)}")
                 return token
 
-            challenge_input = page.ele("@name=cf-turnstile-response")
+            # Try multiple ways to click the Turnstile widget
+            if attempt % 3 == 0:
+                page.run_js(
+                    """
+try {
+  const frames = Array.from(document.querySelectorAll('iframe[src*="turnstile"], iframe[src*="challenges.cloudflare"]'));
+  for (const f of frames) {
+    try { f.scrollIntoView({block:'center'}); f.click(); } catch(e) {}
+  }
+  const boxes = Array.from(document.querySelectorAll('.cf-turnstile, [data-sitekey], div[id*="turnstile" i]'));
+  for (const b of boxes) {
+    try { b.scrollIntoView({block:'center'}); b.click(); } catch(e) {}
+  }
+} catch(e) {}
+                    """
+                )
+
+            challenge_input = page.ele("@name=cf-turnstile-response", timeout=0.5)
             if challenge_input:
                 wrapper = challenge_input.parent()
                 iframe = None
@@ -2516,7 +2557,16 @@ try {
                     iframe = wrapper.shadow_root.ele("tag:iframe")
                 except Exception:
                     iframe = None
+                if iframe is None:
+                    try:
+                        iframe = page.ele('tag:iframe@src:turnstile', timeout=0.5) or page.ele('tag:iframe@src:challenges.cloudflare', timeout=0.5)
+                    except Exception:
+                        iframe = None
                 if iframe:
+                    try:
+                        iframe.click()
+                    except Exception:
+                        pass
                     try:
                         iframe.run_js(
                             """
@@ -2524,33 +2574,33 @@ window.dtp = 1;
 function getRandomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
 let sx = getRandomInt(800, 1200);
 let sy = getRandomInt(400, 700);
-Object.defineProperty(MouseEvent.prototype, 'screenX', { value: sx });
-Object.defineProperty(MouseEvent.prototype, 'screenY', { value: sy });
+try {
+  Object.defineProperty(MouseEvent.prototype, 'screenX', { get: () => sx, configurable: true });
+  Object.defineProperty(MouseEvent.prototype, 'screenY', { get: () => sy, configurable: true });
+} catch(e) {}
                             """
                         )
                     except Exception:
                         pass
                     try:
-                        body_sr = iframe.ele("tag:body").shadow_root
-                        btn = body_sr.ele("tag:input")
-                        if btn:
-                            btn.click()
+                        body = iframe.ele("tag:body", timeout=0.5)
+                        if body:
+                            try:
+                                body_sr = body.shadow_root
+                                btn = body_sr.ele("tag:input") or body_sr.ele("tag:label") or body_sr.ele("tag:span")
+                                if btn:
+                                    btn.click()
+                            except Exception:
+                                try:
+                                    body.click()
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
-            else:
-                # 兜底：尝试触发页面上可见的 Turnstile 容器
-                page.run_js(
-                    """
-const nodes = Array.from(document.querySelectorAll('div,span,iframe')).filter((n) => {
-  const txt = (n.className || '') + ' ' + (n.id || '') + ' ' + (n.getAttribute?.('src') || '');
-  return String(txt).toLowerCase().includes('turnstile');
-});
-if (nodes.length && typeof nodes[0].click === 'function') nodes[0].click();
-                    """
-                )
-        except Exception:
-            pass
-        sleep_with_cancel(1, cancel_callback)
+        except Exception as exc:
+            if log_callback and attempt % 8 == 0:
+                log_callback(f"[Debug] Turnstile 轮询异常: {exc}")
+        sleep_with_cancel(1.2, cancel_callback)
 
     raise Exception("Turnstile 获取 token 失败")
 
