@@ -43,28 +43,24 @@ jobs:
           sudo systemctl enable --now warp-svc.service
           sudo systemctl restart warp-svc.service
           sleep 4
-
           warp-cli --accept-tos registration new
-          # Full tunnel mode: system traffic goes through WARP (no browser proxy needed)
           warp-cli --accept-tos mode warp
           warp-cli --accept-tos connect
-
           for i in $(seq 1 40); do
             st=$(warp-cli --accept-tos status 2>/dev/null || true)
             echo "WARP status [$i]: $st"
             echo "$st" | grep -qi Connected && break
             sleep 2
           done
-
           echo "Egress IPv4: $(curl -4 -s --max-time 15 https://ifconfig.me || true)"
           echo "Egress IPv6: $(curl -6 -s --max-time 15 https://ifconfig.me || true)"
           warp-cli --accept-tos status || true
 
-          # Also expose SOCKS5 proxy as fallback for browser (optional)
-          # Keep a second mode only if full tunnel fails later; for now stay in warp mode.
-
       - name: Install Python dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          # Optional captcha solvers if secrets present (installed always; used only when configured)
+          pip install capsolver 2>/dev/null || true
 
       - name: Generate config.json from secrets
         env:
@@ -75,12 +71,11 @@ jobs:
           GROK2API_REMOTE_BASE: ${{ secrets.GROK2API_REMOTE_BASE }}
           GROK2API_REMOTE_APP_KEY: ${{ secrets.GROK2API_REMOTE_APP_KEY }}
           PROXY: ${{ secrets.PROXY }}
-          USE_WARP: ${{ github.event.inputs.use_warp || '1' }}
+          CAPSOLVER_API_KEY: ${{ secrets.CAPSOLVER_API_KEY }}
+          TWOCAPTCHA_API_KEY: ${{ secrets.TWOCAPTCHA_API_KEY }}
         run: |
           python3 << 'PY'
           import json, os
-          # Prefer explicit PROXY secret. When WARP full-tunnel is active, leave proxy empty
-          # so Chromium uses system routing through WARP.
           proxy = (os.environ.get("PROXY") or "").strip()
           cfg = {
             "email_provider": "cloudflare",
@@ -102,10 +97,13 @@ jobs:
             "grok2api_auto_add_remote": True,
             "grok2api_remote_base": os.environ["GROK2API_REMOTE_BASE"].rstrip("/"),
             "grok2api_remote_app_key": os.environ["GROK2API_REMOTE_APP_KEY"],
+            "capsolver_api_key": (os.environ.get("CAPSOLVER_API_KEY") or "").strip(),
+            "twocaptcha_api_key": (os.environ.get("TWOCAPTCHA_API_KEY") or "").strip(),
           }
           with open("config.json", "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2, ensure_ascii=False)
           print("count=", cfg["register_count"], "proxy=", cfg["proxy"] or "<system/WARP>")
+          print("capsolver=", bool(cfg["capsolver_api_key"]), "2captcha=", bool(cfg["twocaptcha_api_key"]))
           PY
 
       - name: Run Grok Registration
@@ -113,12 +111,19 @@ jobs:
           CI: "true"
           GROK_HEADLESS: "0"
           DISPLAY: ":99"
+          CAPSOLVER_API_KEY: ${{ secrets.CAPSOLVER_API_KEY }}
+          TWOCAPTCHA_API_KEY: ${{ secrets.TWOCAPTCHA_API_KEY }}
         run: |
           Xvfb :99 -screen 0 1920x1080x24 &
           sleep 2
-          # Show egress during run
           echo "Runtime IP: $(curl -4 -s --max-time 10 https://ifconfig.me || true)"
+          set +e
           echo "start" | python grok_register_ttk.py cli
+          code=$?
+          set -e
+          # Always keep logs/artifacts even on failure
+          ls -la accounts_*.txt mail_credentials.txt debug_*.html 2>/dev/null || true
+          exit $code
         timeout-minutes: 110
 
       - name: Upload account files
@@ -129,5 +134,7 @@ jobs:
           path: |
             accounts_*.txt
             mail_credentials.txt
+            debug_*.html
+            *.png
           if-no-files-found: warn
           retention-days: 7
