@@ -1,16 +1,15 @@
 {
-  "manifest_version": 3,
-  "name": "Turnstile Patch",
-  "version": "2.0.0",
-  "description": "Patch browser fingerprints used by Cloudflare Turnstile",
-  "content_scripts": [
-    {
-      "js": ["script.js"],
-      "matches": ["<all_urls>"],
-      "run_at": "document_start",
-      "all_frames": true,
-      "match_about_blank": true,
-      "world": "MAIN"
-    }
-  ]
+    "manifest_version": 2,
+    "name": "Turnstile Patch",
+    "version": "1.0.0",
+    "description": "Patch browser automation detection for Turnstile",
+    "content_scripts": [
+        {
+            "matches": ["<all_urls>"],
+            "js": ["content.js"],
+            "run_at": "document_start",
+            "all_frames": true
+        }
+    ],
+    "permissions": ["activeTab"]
 }
