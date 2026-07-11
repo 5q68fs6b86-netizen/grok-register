@@ -765,19 +765,28 @@ def create_browser_options(browser_proxy=""):
         options.set_argument("--disable-infobars")
         options.set_argument("--no-first-run")
         options.set_argument("--no-default-browser-check")
-        options.set_argument("--disable-features=IsolateOrigins,site-per-process")
+        # Keep process model close to normal Chrome for Turnstile iframe loading
+        options.set_argument("--disable-features=AutomationControlled")
+        options.set_argument("--disable-component-extensions-with-background-pages")
+        options.set_argument("--enable-features=NetworkService,NetworkServiceInProcess")
+        options.set_argument("--ignore-certificate-errors")
+        options.set_argument("--allow-running-insecure-content")
+        # Third-party cookies help some CF widgets
         try:
+            options.set_pref("profile.default_content_setting_values.cookies", 1)
+            options.set_pref("profile.block_third_party_cookies", False)
             options.set_pref("credentials_enable_service", False)
-        except Exception:
-            pass
-        # exclude switches if supported
-        try:
-            options.set_argument("--excludeSwitches=enable-automation")
+            options.set_pref("profile.password_manager_enabled", False)
         except Exception:
             pass
         try:
             options.set_argument("--disable-extensions-except=" + EXTENSION_PATH)
             options.set_argument("--load-extension=" + EXTENSION_PATH)
+        except Exception:
+            pass
+        # Make browser look less like automation
+        try:
+            options.set_argument("--disable-automation")
         except Exception:
             pass
         ua = get_user_agent()
@@ -2504,6 +2513,249 @@ return 'clicked';
     raise Exception("验证码已获取，但自动填写/提交失败")
 
 
+
+def force_turnstile_widget_load(log_callback=None):
+    """Best-effort: ensure Turnstile script/widget is present and visible."""
+    global page
+    if page is None:
+        return False
+    try:
+        info = page.run_js(
+            r"""
+try {
+  // Ensure turnstile script
+  let script = document.querySelector('script[src*="challenges.cloudflare.com/turnstile"], script[src*="turnstile"]');
+  if (!script) {
+    script = document.createElement('script');
+    script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+    script.async = true;
+    document.head.appendChild(script);
+  }
+  // Find sitekey from page
+  let sitekey = '';
+  const skEl = document.querySelector('[data-sitekey]');
+  if (skEl) sitekey = skEl.getAttribute('data-sitekey') || '';
+  if (!sitekey) {
+    const html = document.documentElement.innerHTML;
+    const m = html.match(/sitekey["'\s:=]+([0-9a-zA-Z_-]{20,})/);
+    if (m) sitekey = m[1];
+  }
+  // Also search scripts text
+  if (!sitekey) {
+    for (const s of Array.from(document.scripts)) {
+      const t = s.textContent || '';
+      const m = t.match(/sitekey["'\s:=]+([0-9a-zA-Z_-]{20,})/);
+      if (m) { sitekey = m[1]; break; }
+    }
+  }
+  // Create widget container if missing
+  let box = document.querySelector('.cf-turnstile, [data-sitekey]');
+  if (!box && sitekey) {
+    box = document.createElement('div');
+    box.className = 'cf-turnstile';
+    box.setAttribute('data-sitekey', sitekey);
+    box.style.display = 'block';
+    box.style.minHeight = '65px';
+    const form = document.querySelector('form') || document.body;
+    form.appendChild(box);
+  }
+  // Explicit render if possible
+  let rendered = false;
+  if (window.turnstile && sitekey) {
+    try {
+      const el = document.querySelector('.cf-turnstile') || box;
+      if (el && !el.getAttribute('data-widget-id')) {
+        const id = turnstile.render(el, {
+          sitekey,
+          callback: (token) => {
+            window.__tp_token = token;
+            const input = document.querySelector('input[name="cf-turnstile-response"]');
+            if (input) {
+              input.value = token;
+              input.dispatchEvent(new Event('input', { bubbles: true }));
+              input.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+          }
+        });
+        if (el) el.setAttribute('data-widget-id', String(id));
+        rendered = true;
+      }
+    } catch (e) {
+      return {ok:false, err:String(e), sitekey};
+    }
+  }
+  const frames = Array.from(document.querySelectorAll('iframe')).map(f => ({src:f.src||'', w:f.offsetWidth, h:f.offsetHeight, title:f.title||''}));
+  return {
+    ok: true,
+    sitekey,
+    rendered,
+    hasTurnstileApi: !!(window.turnstile),
+    frames,
+    hasInput: !!document.querySelector('input[name="cf-turnstile-response"]'),
+  };
+} catch (e) {
+  return {ok:false, err:String(e)};
+}
+            """
+        )
+        if log_callback:
+            log_callback(f"[Debug] force_turnstile_widget_load: {info}")
+        return bool(info and info.get("ok"))
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] force_turnstile_widget_load failed: {exc}")
+        return False
+
+
+
+def solve_turnstile_via_service(sitekey, page_url, log_callback=None):
+    """Solve Turnstile via CapSolver / 2Captcha if API keys configured."""
+    sitekey = str(sitekey or "").strip()
+    page_url = str(page_url or "").strip()
+    if not sitekey or not page_url:
+        return ""
+
+    cap_key = str(config.get("capsolver_api_key") or os.environ.get("CAPSOLVER_API_KEY") or "").strip()
+    two_key = str(config.get("twocaptcha_api_key") or os.environ.get("TWOCAPTCHA_API_KEY") or "").strip()
+
+    # CapSolver
+    if cap_key:
+        try:
+            if log_callback:
+                log_callback("[*] 尝试 CapSolver 解决 Turnstile...")
+            create = http_post(
+                "https://api.capsolver.com/createTask",
+                json={
+                    "clientKey": cap_key,
+                    "task": {
+                        "type": "AntiTurnstileTaskProxyLess",
+                        "websiteURL": page_url,
+                        "websiteKey": sitekey,
+                    },
+                },
+                timeout=60,
+            )
+            data = create.json()
+            task_id = data.get("taskId")
+            if not task_id:
+                if log_callback:
+                    log_callback(f"[Debug] CapSolver createTask failed: {data}")
+            else:
+                for _ in range(40):
+                    time.sleep(3)
+                    res = http_post(
+                        "https://api.capsolver.com/getTaskResult",
+                        json={"clientKey": cap_key, "taskId": task_id},
+                        timeout=60,
+                    )
+                    payload = res.json()
+                    if payload.get("status") == "ready":
+                        token = (
+                            (payload.get("solution") or {}).get("token")
+                            or (payload.get("solution") or {}).get("gRecaptchaResponse")
+                            or ""
+                        )
+                        token = str(token).strip()
+                        if token:
+                            if log_callback:
+                                log_callback(f"[+] CapSolver 成功, token长度={len(token)}")
+                            return token
+                    if payload.get("status") == "failed" or payload.get("errorId"):
+                        if log_callback:
+                            log_callback(f"[Debug] CapSolver failed: {payload}")
+                        break
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] CapSolver exception: {exc}")
+
+    # 2Captcha
+    if two_key:
+        try:
+            if log_callback:
+                log_callback("[*] 尝试 2Captcha 解决 Turnstile...")
+            import urllib.parse
+            q = urllib.parse.urlencode({
+                "key": two_key,
+                "method": "turnstile",
+                "sitekey": sitekey,
+                "pageurl": page_url,
+                "json": 1,
+            })
+            create = http_get(f"https://2captcha.com/in.php?{q}", timeout=60)
+            data = create.json()
+            if data.get("status") != 1:
+                if log_callback:
+                    log_callback(f"[Debug] 2Captcha in.php failed: {data}")
+            else:
+                req_id = data.get("request")
+                for _ in range(40):
+                    time.sleep(5)
+                    res = http_get(
+                        f"https://2captcha.com/res.php?key={two_key}&action=get&id={req_id}&json=1",
+                        timeout=60,
+                    )
+                    payload = res.json()
+                    if payload.get("status") == 1:
+                        token = str(payload.get("request") or "").strip()
+                        if token:
+                            if log_callback:
+                                log_callback(f"[+] 2Captcha 成功, token长度={len(token)}")
+                            return token
+                    if payload.get("request") not in ("CAPCHA_NOT_READY", "CAPTCHA_NOT_READY"):
+                        # continue if not ready, else break on hard error
+                        if "NOT_READY" not in str(payload.get("request")):
+                            if log_callback:
+                                log_callback(f"[Debug] 2Captcha res: {payload}")
+                            if payload.get("status") == 0 and "NOT_READY" not in str(payload):
+                                # maybe still waiting
+                                pass
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] 2Captcha exception: {exc}")
+
+    return ""
+
+
+def extract_turnstile_sitekey(log_callback=None):
+    global page
+    if page is None:
+        return ""
+    try:
+        sitekey = page.run_js(
+            r"""
+try {
+  const el = document.querySelector('[data-sitekey]');
+  if (el) return el.getAttribute('data-sitekey') || '';
+  const html = document.documentElement.innerHTML;
+  let m = html.match(/sitekey["'\s:=]+([0-9a-zA-Z_-]{20,})/);
+  if (m) return m[1];
+  m = html.match(/0x[0-9A-Za-z]{20,}/);
+  if (m) return m[0];
+  for (const s of Array.from(document.scripts)) {
+    const t = s.textContent || '';
+    m = t.match(/sitekey["'\s:=]+([0-9a-zA-Z_-]{20,})/);
+    if (m) return m[1];
+  }
+  // iframe src
+  for (const f of Array.from(document.querySelectorAll('iframe'))) {
+    const src = f.src || '';
+    m = src.match(/[?&]sitekey=([^&]+)/);
+    if (m) return decodeURIComponent(m[1]);
+  }
+  return window.__tp_sitekey || '';
+} catch(e) { return ''; }
+            """
+        )
+        sitekey = str(sitekey or "").strip()
+        if log_callback:
+            log_callback(f"[Debug] extracted sitekey={sitekey[:24]}..." if sitekey else "[Debug] sitekey not found")
+        return sitekey
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] extract sitekey failed: {exc}")
+        return ""
+
+
 def getTurnstileToken(log_callback=None, cancel_callback=None):
     global page
     if page is None:
@@ -2587,6 +2839,30 @@ try {
         page.run_js("try { if (window.turnstile && turnstile.reset) turnstile.reset(); } catch(e) {}")
     except Exception:
         pass
+
+    # External captcha services first if configured
+    try:
+        sitekey = extract_turnstile_sitekey(log_callback=log_callback)
+        page_url = ""
+        try:
+            page_url = str(page.url or "")
+        except Exception:
+            page_url = "https://accounts.x.ai/sign-up?redirect=grok-com"
+        if sitekey:
+            token = solve_turnstile_via_service(sitekey, page_url, log_callback=log_callback)
+            if token and len(token) >= 80:
+                return token
+        else:
+            # Still try force load then extract again
+            force_turnstile_widget_load(log_callback=log_callback)
+            sitekey = extract_turnstile_sitekey(log_callback=log_callback)
+            if sitekey:
+                token = solve_turnstile_via_service(sitekey, page_url, log_callback=log_callback)
+                if token and len(token) >= 80:
+                    return token
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] external turnstile solve skipped: {exc}")
 
     for attempt in range(0, 40):
         raise_if_cancelled(cancel_callback)
@@ -2696,6 +2972,20 @@ try {
         sleep_with_cancel(1.0, cancel_callback)
 
     _diag()
+    try:
+        html = page.html if page else ""
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"debug_turnstile_{int(time.time())}.html")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html or "")
+        if log_callback:
+            log_callback(f"[Debug] 已保存 Turnstile 页面 HTML: {path}")
+        try:
+            page.get_screenshot(path=path.replace('.html', '.png'), full_page=True)
+        except Exception:
+            pass
+    except Exception as dump_exc:
+        if log_callback:
+            log_callback(f"[Debug] dump html failed: {dump_exc}")
     raise Exception("Turnstile 获取 token 失败")
 
 
@@ -2724,7 +3014,7 @@ def build_profile():
     return given_name, family_name, password
 
 
-def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None):
+def fill_profile_and_submit(timeout=180, log_callback=None, cancel_callback=None):
     given_name, family_name, password = build_profile()
     deadline = time.time() + timeout
     form_filled_once = False
@@ -2816,6 +3106,9 @@ return 'filled-no-submit';
                     token_len = filled.split(":", 1)[1] if ":" in filled else "0"
                     log_callback(f"[*] 资料已填写，等待 Cloudflare 人机验证通过... 当前token长度={token_len}")
                 if token_len == "0":
+                    # Try to force-load widget once when empty
+                    if wait_cf_since is None:
+                        force_turnstile_widget_load(log_callback=log_callback)
                     pause_seconds = random.uniform(1, 3)
                     if log_callback:
                         log_callback(f"[*] Cloudflare token 为空，暂停 {pause_seconds:.1f}s 后继续检测")
