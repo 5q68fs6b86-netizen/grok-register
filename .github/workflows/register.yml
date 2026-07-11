@@ -7,6 +7,10 @@ on:
         description: 'Number of accounts to register'
         required: true
         default: '1'
+      use_warp:
+        description: 'Use Cloudflare WARP (1/0)'
+        required: false
+        default: '1'
 
 jobs:
   register:
@@ -23,10 +27,50 @@ jobs:
       - name: Install Google Chrome
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget gnupg xvfb fonts-liberation
+          sudo apt-get install -y wget gnupg xvfb fonts-liberation curl
           wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
           sudo apt-get install -y /tmp/chrome.deb || sudo apt-get -f install -y
           google-chrome --version
+
+      - name: Install and connect Cloudflare WARP
+        if: ${{ github.event.inputs.use_warp != '0' }}
+        run: |
+          set -e
+          # Install WARP client
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          sudo apt-get update
+          sudo apt-get install -y cloudflare-warp || {
+            # fallback package name/path
+            curl -fsSL -o /tmp/warp.deb https://pkg.cloudflareclient.com/uploads/cloudflare_warp_latest_amd64.deb || true
+            sudo apt-get install -y /tmp/warp.deb || sudo dpkg -i /tmp/warp.deb || true
+          }
+          which warp-cli || ls /bin/warp* /usr/bin/warp* || true
+          # Register & connect (non-interactive)
+          sudo mkdir -p /var/lib/cloudflare-warp || true
+          # Accept TOS and register
+          yes | sudo warp-cli --accept-tos registration new || sudo warp-cli registration new || true
+          sudo warp-cli mode warp || true
+          sudo warp-cli connect || true
+          # Wait for connection
+          for i in $(seq 1 30); do
+            st=$(warp-cli status 2>/dev/null || sudo warp-cli status 2>/dev/null || echo none)
+            echo "WARP status [$i]: $st"
+            echo "$st" | grep -qi "Connected" && break
+            sleep 2
+          done
+          # Show egress IP
+          curl -s https://ifconfig.me || curl -s https://api.ipify.org || true
+          echo
+          # Local WARP proxy often listens on 127.0.0.1:40000 when in proxy mode
+          # Also try enabling proxy mode as fallback for browser
+          sudo warp-cli mode proxy || true
+          sudo warp-cli proxy port 40000 || true
+          sudo warp-cli connect || true
+          sleep 3
+          curl -s --proxy http://127.0.0.1:40000 https://ifconfig.me || echo "proxy mode ip check failed"
+          echo
+          warp-cli status || sudo warp-cli status || true
 
       - name: Install Python dependencies
         run: pip install -r requirements.txt
@@ -40,9 +84,24 @@ jobs:
           GROK2API_REMOTE_BASE: ${{ secrets.GROK2API_REMOTE_BASE }}
           GROK2API_REMOTE_APP_KEY: ${{ secrets.GROK2API_REMOTE_APP_KEY }}
           PROXY: ${{ secrets.PROXY }}
+          USE_WARP: ${{ github.event.inputs.use_warp || '1' }}
         run: |
           python3 << 'PY'
-          import json, os
+          import json, os, socket
+          proxy = (os.environ.get("PROXY") or "").strip()
+          use_warp = os.environ.get("USE_WARP", "1") != "0"
+          # Prefer explicit PROXY secret; otherwise use local WARP proxy if listening
+          if not proxy and use_warp:
+              sock = socket.socket()
+              sock.settimeout(1)
+              try:
+                  sock.connect(("127.0.0.1", 40000))
+                  proxy = "http://127.0.0.1:40000"
+                  print("using WARP local proxy", proxy)
+              except Exception as e:
+                  print("WARP proxy not available:", e)
+              finally:
+                  sock.close()
           cfg = {
             "email_provider": "cloudflare",
             "cloudflare_api_base": os.environ["CLOUDFLARE_API_BASE"].rstrip("/"),
@@ -53,7 +112,7 @@ jobs:
             "cloudflare_path_token": "/api/token",
             "cloudflare_path_messages": "/api/mails",
             "defaultDomains": os.environ["CLOUDFLARE_DOMAINS"],
-            "proxy": (os.environ.get("PROXY") or "").strip(),
+            "proxy": proxy,
             "enable_nsfw": True,
             "register_count": int(os.environ.get("REGISTER_COUNT") or "1"),
             "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
@@ -70,14 +129,13 @@ jobs:
           print("api_base=", cfg["cloudflare_api_base"])
           print("domains=", cfg["defaultDomains"])
           print("count=", cfg["register_count"])
-          print("proxy_set=", bool(cfg["proxy"]))
+          print("proxy_set=", bool(cfg["proxy"]), "proxy=", cfg["proxy"][:40] if cfg["proxy"] else "")
           print("grok2api=", cfg["grok2api_remote_base"])
           PY
 
       - name: Run Grok Registration
         env:
           CI: "true"
-          # Use headed Chrome under Xvfb; pure headless is almost always CF-blocked
           GROK_HEADLESS: "0"
           DISPLAY: ":99"
         run: |
@@ -97,6 +155,12 @@ jobs:
           options.set_argument("--remote-allow-origins=*")
           options.set_argument("--window-size=1920,1080")
           options.set_browser_path("/usr/bin/google-chrome")
+          # load extension if present
+          import os
+          ext = os.path.abspath("turnstilePatch")
+          if os.path.isdir(ext):
+              options.add_extension(ext)
+              print("extension loaded", ext)
           browser = Chromium(options)
           tab = browser.latest_tab
           tab.get("https://example.com")
