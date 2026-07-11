@@ -83,15 +83,20 @@ jobs:
           sleep 2
           # Quick browser smoke test
           python3 - <<'PY'
-          import os
+          import socket
           from DrissionPage import Chromium, ChromiumOptions
           options = ChromiumOptions()
-          options.auto_port()
+          with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+              s.bind(("127.0.0.1", 0))
+              port = s.getsockname()[1]
+          options.set_local_port(port)
           options.headless(True)
           options.set_argument("--no-sandbox")
           options.set_argument("--disable-dev-shm-usage")
           options.set_argument("--disable-gpu")
+          options.set_argument("--remote-allow-origins=*")
           options.set_browser_path("/usr/bin/google-chrome")
+          print("smoke address=", getattr(options, "address", None), "browser_path=", getattr(options, "browser_path", None))
           browser = Chromium(options)
           tab = browser.latest_tab
           tab.get("https://example.com")

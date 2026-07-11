@@ -726,19 +726,26 @@ def apply_browser_proxy_option(options, proxy):
 
 def create_browser_options(browser_proxy=""):
     options = ChromiumOptions()
-    options.auto_port()
     options.set_timeouts(base=1)
     # CI / headless-friendly (GitHub Actions, Docker, etc.)
     if os.environ.get("CI") or os.environ.get("GROK_HEADLESS") == "1":
+        # Explicit host:port avoids DrissionPage unpack error when address is incomplete
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            free_port = s.getsockname()[1]
+        options.set_local_port(free_port)
         options.headless(True)
         options.set_argument("--no-sandbox")
         options.set_argument("--disable-dev-shm-usage")
         options.set_argument("--disable-gpu")
         options.set_argument("--window-size=1920,1080")
         options.set_argument("--disable-blink-features=AutomationControlled")
+        options.set_argument("--remote-allow-origins=*")
         for bin_path in (
             "/usr/bin/google-chrome",
             "/usr/bin/google-chrome-stable",
+            "/opt/google/chrome/google-chrome",
             "/opt/google/chrome/chrome",
             "/usr/bin/chromium-browser",
             "/usr/bin/chromium",
@@ -747,10 +754,10 @@ def create_browser_options(browser_proxy=""):
             if os.path.exists(bin_path):
                 options.set_browser_path(bin_path)
                 break
-        # Avoid loading local turnstile extension in CI (often breaks headless)
-        # Extension is skipped intentionally under CI.
+        # Skip turnstile extension under CI headless
         apply_browser_proxy_option(options, browser_proxy)
         return options
+    options.auto_port()
     apply_browser_proxy_option(options, browser_proxy)
     if os.path.exists(EXTENSION_PATH):
         options.add_extension(EXTENSION_PATH)
