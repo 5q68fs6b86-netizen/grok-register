@@ -711,24 +711,31 @@ def apply_browser_proxy_option(options, proxy):
     if not proxy:
         return
     raw = str(proxy or "").strip()
-    # Chromium expects socks5://host:port or host:port for HTTP
-    # Keep scheme for socks5/socks5h
-    chrome_proxy = raw
+    if not raw:
+        return
     lower = raw.lower()
+    # Normalize socks5h -> socks5 for Chromium
     if lower.startswith("socks5h://"):
-        chrome_proxy = "socks5://" + raw.split("://", 1)[1]
-    if hasattr(options, "set_proxy"):
+        raw = "socks5://" + raw.split("://", 1)[1]
+        lower = raw.lower()
+    # DrissionPage set_proxy() rejects socks proxies with a Chinese warning.
+    # Always use Chromium --proxy-server for socks; only try set_proxy for http(s).
+    is_socks = lower.startswith("socks5://") or lower.startswith("socks://") or lower.startswith("socks4://")
+    if (not is_socks) and hasattr(options, "set_proxy"):
         try:
-            options.set_proxy(chrome_proxy)
+            options.set_proxy(raw)
             return
         except Exception:
             pass
     if not hasattr(options, "set_argument"):
         raise AttributeError("当前 DrissionPage ChromiumOptions 不支持设置浏览器代理")
+    # Chrome flag forms:
+    #   --proxy-server=http://host:port
+    #   --proxy-server=socks5://host:port
     try:
-        options.set_argument(f"--proxy-server={chrome_proxy}")
+        options.set_argument(f"--proxy-server={raw}")
     except TypeError:
-        options.set_argument("--proxy-server", chrome_proxy)
+        options.set_argument("--proxy-server", raw)
 
 
 def create_browser_options(browser_proxy=""):
