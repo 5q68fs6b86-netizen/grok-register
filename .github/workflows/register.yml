@@ -11,10 +11,6 @@ on:
         description: 'Use Cloudflare WARP (1/0)'
         required: false
         default: '1'
-      register_mode:
-        description: 'auto | protocol | browser'
-        required: false
-        default: 'protocol'
 
 jobs:
   register:
@@ -63,7 +59,6 @@ jobs:
         run: |
           pip install -U pip
           pip install -r requirements.txt
-          pip install curl_cffi requests 2>/dev/null || true
 
       - name: Generate config.json from secrets
         env:
@@ -71,13 +66,9 @@ jobs:
           CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
           CLOUDFLARE_DOMAINS: ${{ secrets.CLOUDFLARE_DOMAINS }}
           REGISTER_COUNT: ${{ github.event.inputs.count || '1' }}
-          REGISTER_MODE: ${{ github.event.inputs.register_mode || 'protocol' }}
           GROK2API_REMOTE_BASE: ${{ secrets.GROK2API_REMOTE_BASE }}
           GROK2API_REMOTE_APP_KEY: ${{ secrets.GROK2API_REMOTE_APP_KEY }}
           PROXY: ${{ secrets.PROXY }}
-          CAPSOLVER_API_KEY: ${{ secrets.CAPSOLVER_API_KEY }}
-          TWOCAPTCHA_API_KEY: ${{ secrets.TWOCAPTCHA_API_KEY }}
-          YESCAPTCHA_API_KEY: ${{ secrets.YESCAPTCHA_API_KEY }}
         run: |
           python3 << 'PY'
           import json, os
@@ -95,24 +86,18 @@ jobs:
             "proxy": proxy,
             "enable_nsfw": True,
             "register_count": int(os.environ.get("REGISTER_COUNT") or "1"),
-            "register_mode": (os.environ.get("REGISTER_MODE") or "protocol").strip() or "protocol",
-            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
             "grok2api_auto_add_local": False,
             "grok2api_local_token_file": "",
             "grok2api_pool_name": "ssoBasic",
             "grok2api_auto_add_remote": True,
             "grok2api_remote_base": os.environ["GROK2API_REMOTE_BASE"].rstrip("/"),
             "grok2api_remote_app_key": os.environ["GROK2API_REMOTE_APP_KEY"],
-            "capsolver_api_key": (os.environ.get("CAPSOLVER_API_KEY") or "").strip(),
-            "twocaptcha_api_key": (os.environ.get("TWOCAPTCHA_API_KEY") or "").strip(),
-            "yescaptcha_api_key": (os.environ.get("YESCAPTCHA_API_KEY") or "").strip(),
           }
           with open("config.json", "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2, ensure_ascii=False)
-          print("count=", cfg["register_count"], "mode=", cfg["register_mode"])
-          print("capsolver=", bool(cfg["capsolver_api_key"]), "yescaptcha=", bool(cfg["yescaptcha_api_key"]), "2captcha=", bool(cfg["twocaptcha_api_key"]))
-          if not any([cfg["capsolver_api_key"], cfg["yescaptcha_api_key"], cfg["twocaptcha_api_key"]]):
-            print("WARNING: no captcha solver key configured; protocol mode will fail")
+          print("config.json written")
+          print("count=", cfg["register_count"], "proxy=", cfg["proxy"] or "<system/WARP>")
           PY
 
       - name: Run Grok Registration
@@ -120,9 +105,6 @@ jobs:
           CI: "true"
           GROK_HEADLESS: "0"
           DISPLAY: ":99"
-          CAPSOLVER_API_KEY: ${{ secrets.CAPSOLVER_API_KEY }}
-          TWOCAPTCHA_API_KEY: ${{ secrets.TWOCAPTCHA_API_KEY }}
-          YESCAPTCHA_API_KEY: ${{ secrets.YESCAPTCHA_API_KEY }}
         run: |
           Xvfb :99 -screen 0 1920x1080x24 &
           sleep 2
@@ -131,7 +113,7 @@ jobs:
           echo "start" | python grok_register_ttk.py cli
           code=$?
           set -e
-          ls -la accounts_*.txt mail_credentials.txt debug_* 2>/dev/null || true
+          ls -la accounts_*.txt mail_credentials.txt debug_* cpa_auths/ 2>/dev/null || true
           exit $code
         timeout-minutes: 110
 
@@ -144,6 +126,6 @@ jobs:
             accounts_*.txt
             mail_credentials.txt
             debug_*
-            *.png
+            cpa_auths/
           if-no-files-found: warn
           retention-days: 7
