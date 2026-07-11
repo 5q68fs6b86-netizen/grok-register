@@ -40,51 +40,31 @@ jobs:
           echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
           sudo apt-get update
           sudo apt-get install -y cloudflare-warp
-          which warp-cli
-          warp-cli --version || true
+          sudo systemctl enable --now warp-svc.service
+          sudo systemctl restart warp-svc.service
+          sleep 4
 
-          # Ensure daemon is running
-          sudo systemctl enable --now warp-svc.service || true
-          sudo systemctl restart warp-svc.service || true
-          sleep 3
-          systemctl is-active warp-svc.service || true
-
-          # Non-interactive TOS + registration (try multiple CLI variants)
-          set +e
-          # Prefer global --accept-tos before subcommand (official non-TTY form)
+          # Non-interactive registration
           warp-cli --accept-tos registration new
-          code1=$?
-          echo "registration new exit=$code1"
-          if [ $code1 -ne 0 ]; then
-            sudo warp-cli --accept-tos registration new
-            echo "sudo registration exit=$?"
-          fi
-          # Some builds use separate accept
-          warp-cli accept-tos 2>/dev/null || true
-          sudo warp-cli accept-tos 2>/dev/null || true
+          # Prefer proxy mode: local SOCKS5 on 40000 (NOT http)
+          warp-cli --accept-tos mode proxy
+          warp-cli --accept-tos proxy port 40000 || true
+          warp-cli --accept-tos connect
 
-          # Switch to proxy mode for browser consumption (HTTP proxy on 40000)
-          warp-cli --accept-tos mode proxy || sudo warp-cli --accept-tos mode proxy || warp-cli mode proxy || sudo warp-cli mode proxy
-          warp-cli --accept-tos proxy port 40000 || sudo warp-cli proxy port 40000 || warp-cli proxy port 40000 || true
-          warp-cli --accept-tos connect || sudo warp-cli --accept-tos connect || warp-cli connect || sudo warp-cli connect
-          set -e
-
-          for i in $(seq 1 40); do
-            st=$(warp-cli status 2>/dev/null || sudo warp-cli status 2>/dev/null || echo none)
+          for i in $(seq 1 30); do
+            st=$(warp-cli --accept-tos status 2>/dev/null || true)
             echo "WARP status [$i]: $st"
-            echo "$st" | grep -Eiq "Connected|Status update: Connected|Proxy" && break
-            # also success if proxy port is open
             if (echo >/dev/tcp/127.0.0.1/40000) >/dev/null 2>&1; then
-              echo "proxy port 40000 is open"
+              echo "proxy port 40000 open"
               break
             fi
             sleep 2
           done
 
-          echo "Direct IP:" $(curl -s --max-time 10 https://ifconfig.me || true)
-          echo "Proxy IP:" $(curl -s --max-time 10 --proxy http://127.0.0.1:40000 https://ifconfig.me || echo failed)
-          warp-cli status || sudo warp-cli status || true
-          ss -lntp | grep 40000 || netstat -lntp 2>/dev/null | grep 40000 || true
+          echo "Direct IP: $(curl -4 -s --max-time 10 https://ifconfig.me || true)"
+          echo "SOCKS5 IP: $(curl -4 -s --max-time 15 --socks5-hostname 127.0.0.1:40000 https://ifconfig.me || echo failed)"
+          warp-cli --accept-tos status || true
+          ss -lntp | grep 40000 || true
 
       - name: Install Python dependencies
         run: pip install -r requirements.txt
@@ -105,13 +85,13 @@ jobs:
           proxy = (os.environ.get("PROXY") or "").strip()
           use_warp = os.environ.get("USE_WARP", "1") != "0"
           if not proxy and use_warp:
-              for port in (40000, 40001, 1080):
-                  sock = socket.socket()
-                  sock.settimeout(1)
+              for port in (40000, 40001):
+                  sock = socket.socket(); sock.settimeout(1)
                   try:
                       sock.connect(("127.0.0.1", port))
-                      proxy = f"http://127.0.0.1:{port}"
-                      print("using WARP local proxy", proxy)
+                      # WARP local proxy is SOCKS5
+                      proxy = f"socks5://127.0.0.1:{port}"
+                      print("using WARP SOCKS5 proxy", proxy)
                       break
                   except Exception as e:
                       print(f"port {port} not open: {e}")
@@ -140,8 +120,7 @@ jobs:
           }
           with open("config.json", "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2, ensure_ascii=False)
-          print("config.json written")
-          print("count=", cfg["register_count"], "proxy_set=", bool(cfg["proxy"]), "proxy=", cfg["proxy"])
+          print("count=", cfg["register_count"], "proxy=", cfg["proxy"])
           PY
 
       - name: Run Grok Registration
