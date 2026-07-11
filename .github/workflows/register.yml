@@ -32,7 +32,7 @@ jobs:
           sudo apt-get install -y /tmp/chrome.deb || sudo apt-get -f install -y
           google-chrome --version
 
-      - name: Install and connect Cloudflare WARP
+      - name: Install and connect Cloudflare WARP (full tunnel)
         if: ${{ github.event.inputs.use_warp != '0' }}
         run: |
           set -e
@@ -44,27 +44,24 @@ jobs:
           sudo systemctl restart warp-svc.service
           sleep 4
 
-          # Non-interactive registration
           warp-cli --accept-tos registration new
-          # Prefer proxy mode: local SOCKS5 on 40000 (NOT http)
-          warp-cli --accept-tos mode proxy
-          warp-cli --accept-tos proxy port 40000 || true
+          # Full tunnel mode: system traffic goes through WARP (no browser proxy needed)
+          warp-cli --accept-tos mode warp
           warp-cli --accept-tos connect
 
-          for i in $(seq 1 30); do
+          for i in $(seq 1 40); do
             st=$(warp-cli --accept-tos status 2>/dev/null || true)
             echo "WARP status [$i]: $st"
-            if (echo >/dev/tcp/127.0.0.1/40000) >/dev/null 2>&1; then
-              echo "proxy port 40000 open"
-              break
-            fi
+            echo "$st" | grep -qi Connected && break
             sleep 2
           done
 
-          echo "Direct IP: $(curl -4 -s --max-time 10 https://ifconfig.me || true)"
-          echo "SOCKS5 IP: $(curl -4 -s --max-time 15 --socks5-hostname 127.0.0.1:40000 https://ifconfig.me || echo failed)"
+          echo "Egress IPv4: $(curl -4 -s --max-time 15 https://ifconfig.me || true)"
+          echo "Egress IPv6: $(curl -6 -s --max-time 15 https://ifconfig.me || true)"
           warp-cli --accept-tos status || true
-          ss -lntp | grep 40000 || true
+
+          # Also expose SOCKS5 proxy as fallback for browser (optional)
+          # Keep a second mode only if full tunnel fails later; for now stay in warp mode.
 
       - name: Install Python dependencies
         run: pip install -r requirements.txt
@@ -81,22 +78,10 @@ jobs:
           USE_WARP: ${{ github.event.inputs.use_warp || '1' }}
         run: |
           python3 << 'PY'
-          import json, os, socket
+          import json, os
+          # Prefer explicit PROXY secret. When WARP full-tunnel is active, leave proxy empty
+          # so Chromium uses system routing through WARP.
           proxy = (os.environ.get("PROXY") or "").strip()
-          use_warp = os.environ.get("USE_WARP", "1") != "0"
-          if not proxy and use_warp:
-              for port in (40000, 40001):
-                  sock = socket.socket(); sock.settimeout(1)
-                  try:
-                      sock.connect(("127.0.0.1", port))
-                      # WARP local proxy is SOCKS5
-                      proxy = f"socks5://127.0.0.1:{port}"
-                      print("using WARP SOCKS5 proxy", proxy)
-                      break
-                  except Exception as e:
-                      print(f"port {port} not open: {e}")
-                  finally:
-                      sock.close()
           cfg = {
             "email_provider": "cloudflare",
             "cloudflare_api_base": os.environ["CLOUDFLARE_API_BASE"].rstrip("/"),
@@ -120,7 +105,7 @@ jobs:
           }
           with open("config.json", "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2, ensure_ascii=False)
-          print("count=", cfg["register_count"], "proxy=", cfg["proxy"])
+          print("count=", cfg["register_count"], "proxy=", cfg["proxy"] or "<system/WARP>")
           PY
 
       - name: Run Grok Registration
@@ -131,6 +116,8 @@ jobs:
         run: |
           Xvfb :99 -screen 0 1920x1080x24 &
           sleep 2
+          # Show egress during run
+          echo "Runtime IP: $(curl -4 -s --max-time 10 https://ifconfig.me || true)"
           echo "start" | python grok_register_ttk.py cli
         timeout-minutes: 110
 
