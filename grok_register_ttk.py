@@ -64,6 +64,10 @@ DEFAULT_CONFIG = {
     "grok2api_auto_add_remote": False,
     "grok2api_remote_base": "",
     "grok2api_remote_app_key": "",
+    "capsolver_api_key": "",
+    "twocaptcha_api_key": "",
+    "yescaptcha_api_key": "",
+    "register_mode": "auto",
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -2535,6 +2539,7 @@ try {
   let sitekey = '';
   const skEl = document.querySelector('[data-sitekey]');
   if (skEl) sitekey = skEl.getAttribute('data-sitekey') || '';
+  if (!sitekey) sitekey = '0x4AAAAAAAhr9JGVDZbrZOo0';
   if (!sitekey) {
     const html = document.documentElement.innerHTML;
     const m = html.match(/sitekey["'\s:=]+([0-9a-zA-Z_-]{20,})/);
@@ -2631,6 +2636,7 @@ def solve_turnstile_via_service(sitekey, page_url, log_callback=None):
                         "type": "AntiTurnstileTaskProxyLess",
                         "websiteURL": page_url,
                         "websiteKey": sitekey,
+                        "metadata": {"action": ""},
                     },
                 },
                 timeout=60,
@@ -2771,7 +2777,9 @@ try {
       if (m) return m[0];
     }
   } catch (e) {}
-  return window.__tp_sitekey || '';
+  if (window.__tp_sitekey) return window.__tp_sitekey;
+  // known x.ai signup sitekey fallback
+  return '0x4AAAAAAAhr9JGVDZbrZOo0';
 } catch(e) { return ''; }
             """
         )
@@ -2869,26 +2877,47 @@ try {
     except Exception:
         pass
 
-    # External captcha services first if configured
+    # External captcha services first if configured (critical for GH Actions)
     try:
-        sitekey = extract_turnstile_sitekey(log_callback=log_callback)
-        page_url = ""
+        page_url = "https://accounts.x.ai/sign-up?redirect=grok-com"
         try:
-            page_url = str(page.url or "")
+            u = str(page.url or "")
+            if u:
+                page_url = u
         except Exception:
-            page_url = "https://accounts.x.ai/sign-up?redirect=grok-com"
-        if sitekey:
-            token = solve_turnstile_via_service(sitekey, page_url, log_callback=log_callback)
-            if token and len(token) >= 80:
-                return token
-        else:
-            # Still try force load then extract again
-            force_turnstile_widget_load(log_callback=log_callback)
-            sitekey = extract_turnstile_sitekey(log_callback=log_callback)
-            if sitekey:
-                token = solve_turnstile_via_service(sitekey, page_url, log_callback=log_callback)
-                if token and len(token) >= 80:
-                    return token
+            pass
+        sitekey = extract_turnstile_sitekey(log_callback=log_callback) or "0x4AAAAAAAhr9JGVDZbrZOo0"
+        if log_callback:
+            has_cap = bool(str(config.get("capsolver_api_key") or os.environ.get("CAPSOLVER_API_KEY") or "").strip())
+            has_two = bool(str(config.get("twocaptcha_api_key") or os.environ.get("TWOCAPTCHA_API_KEY") or "").strip())
+            log_callback(f"[Debug] turnstile solve path: sitekey={sitekey[:24]}... capsolver={has_cap} 2captcha={has_two} url={page_url}")
+        token = solve_turnstile_via_service(sitekey, page_url, log_callback=log_callback)
+        if token and len(token) >= 80:
+            # inject token into page immediately
+            try:
+                page.run_js(
+                    """
+const token = String(arguments[0] || '').trim();
+const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+if (cfInput && token) {
+  const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+  if (nativeSetter) nativeSetter.call(cfInput, token);
+  else cfInput.value = token;
+  cfInput.dispatchEvent(new Event('input', { bubbles: true }));
+  cfInput.dispatchEvent(new Event('change', { bubbles: true }));
+}
+window.__tp_token = token;
+                    """,
+                    token,
+                )
+            except Exception:
+                pass
+            return token
+        # force widget then retry once
+        force_turnstile_widget_load(log_callback=log_callback)
+        token = solve_turnstile_via_service(sitekey, page_url, log_callback=log_callback)
+        if token and len(token) >= 80:
+            return token
     except Exception as exc:
         if log_callback:
             log_callback(f"[Debug] external turnstile solve skipped: {exc}")
@@ -3148,6 +3177,37 @@ return 'filled-no-submit';
                             if log_callback:
                                 log_callback(f"[Debug] dump profile html failed: {_e}")
                         force_turnstile_widget_load(log_callback=log_callback)
+                        # Immediately try external solver with known sitekey
+                        try:
+                            sk = extract_turnstile_sitekey(log_callback=log_callback) or "0x4AAAAAAAhr9JGVDZbrZOo0"
+                            purl = "https://accounts.x.ai/sign-up?redirect=grok-com"
+                            try:
+                                if page and page.url:
+                                    purl = str(page.url)
+                            except Exception:
+                                pass
+                            tok = solve_turnstile_via_service(sk, purl, log_callback=log_callback)
+                            if tok and len(tok) >= 80:
+                                page.run_js(
+                                    """
+const token = String(arguments[0] || '').trim();
+const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+if (!cfInput || !token) return 0;
+const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+if (nativeSetter) nativeSetter.call(cfInput, token);
+else cfInput.value = token;
+cfInput.dispatchEvent(new Event('input', { bubbles: true }));
+cfInput.dispatchEvent(new Event('change', { bubbles: true }));
+window.__tp_token = token;
+return String(cfInput.value || '').trim().length;
+                                    """,
+                                    tok,
+                                )
+                                if log_callback:
+                                    log_callback(f"[+] 资料页已注入外部 Turnstile token, len={len(tok)}")
+                        except Exception as _se:
+                            if log_callback:
+                                log_callback(f"[Debug] early external solve failed: {_se}")
                     pause_seconds = random.uniform(1, 3)
                     if log_callback:
                         log_callback(f"[*] Cloudflare token 为空，暂停 {pause_seconds:.1f}s 后继续检测")
@@ -3779,15 +3839,46 @@ class GrokRegisterGUI:
                     if not mail_ok:
                         raise Exception("验证码阶段失败，已达到最大重试次数")
                     self.log(f"[*] 验证码: {code}")
-                    self.log("[*] 4. 填写资料")
-                    profile = fill_profile_and_submit(
-                        log_callback=self.log, cancel_callback=self.should_stop
+                    has_solver = any(
+                        str(config.get(k) or os.environ.get(env) or "").strip()
+                        for k, env in (
+                            ("capsolver_api_key", "CAPSOLVER_API_KEY"),
+                            ("yescaptcha_api_key", "YESCAPTCHA_API_KEY"),
+                            ("twocaptcha_api_key", "TWOCAPTCHA_API_KEY"),
+                        )
                     )
-                    self.log(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
-                    self.log("[*] 5. 等待 sso cookie")
-                    sso = wait_for_sso_cookie(
-                        log_callback=self.log, cancel_callback=self.should_stop
-                    )
+                    mode = str(config.get("register_mode") or "auto").strip().lower()
+                    use_protocol = mode in ("protocol", "api") or (mode == "auto" and has_solver)
+                    if mode == "browser":
+                        use_protocol = False
+                    if use_protocol:
+                        self.log("[*] 4. 协议注册提交 (Turnstile 走打码平台)")
+                        from protocol_register import register_protocol
+                        result = register_protocol(
+                            email=email,
+                            code=code,
+                            config=config,
+                            log_fn=self.log,
+                        )
+                        profile = {
+                            "given_name": result.get("given_name", ""),
+                            "family_name": result.get("family_name", ""),
+                            "password": result.get("password", ""),
+                        }
+                        sso = str(result.get("sso") or "").strip()
+                        if not sso:
+                            raise Exception("协议注册未返回 sso")
+                        self.log(f"[+] 协议注册拿到 sso, len={len(sso)}")
+                    else:
+                        self.log("[*] 4. 填写资料")
+                        profile = fill_profile_and_submit(
+                            log_callback=self.log, cancel_callback=self.should_stop
+                        )
+                        self.log(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
+                        self.log("[*] 5. 等待 sso cookie")
+                        sso = wait_for_sso_cookie(
+                            log_callback=self.log, cancel_callback=self.should_stop
+                        )
                     if config.get("enable_nsfw", True):
                         self.log("[*] 6. 开启 NSFW")
                         nsfw_ok, nsfw_msg = enable_nsfw_for_token(
@@ -3940,15 +4031,52 @@ def run_registration_cli(count):
                 if not mail_ok:
                     raise Exception("验证码阶段失败，已达到最大重试次数")
                 cli_log(f"[*] 验证码: {code}")
-                cli_log("[*] 4. 填写资料")
-                profile = fill_profile_and_submit(
-                    log_callback=cli_log, cancel_callback=controller.should_stop
+
+                # Prefer pure-protocol completion when captcha solver is configured.
+                # Browser Turnstile widgets fail on GitHub Actions (empty iframe).
+                has_solver = any(
+                    str(config.get(k) or os.environ.get(env) or "").strip()
+                    for k, env in (
+                        ("capsolver_api_key", "CAPSOLVER_API_KEY"),
+                        ("yescaptcha_api_key", "YESCAPTCHA_API_KEY"),
+                        ("twocaptcha_api_key", "TWOCAPTCHA_API_KEY"),
+                    )
                 )
-                cli_log(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
-                cli_log("[*] 5. 等待 sso cookie")
-                sso = wait_for_sso_cookie(
-                    log_callback=cli_log, cancel_callback=controller.should_stop
-                )
+                mode = str(config.get("register_mode") or "auto").strip().lower()
+                use_protocol = mode in ("protocol", "api") or (mode == "auto" and has_solver)
+                if mode == "browser":
+                    use_protocol = False
+
+                if use_protocol:
+                    cli_log("[*] 4. 协议注册提交 (Turnstile 走打码平台)")
+                    from protocol_register import register_protocol
+                    result = register_protocol(
+                        email=email,
+                        code=code,
+                        config=config,
+                        log_fn=cli_log,
+                    )
+                    profile = {
+                        "given_name": result.get("given_name", ""),
+                        "family_name": result.get("family_name", ""),
+                        "password": result.get("password", ""),
+                    }
+                    sso = str(result.get("sso") or "").strip()
+                    if not sso:
+                        raise Exception("协议注册未返回 sso")
+                    cli_log(f"[+] 协议注册拿到 sso, len={len(sso)}")
+                else:
+                    cli_log("[*] 4. 填写资料 (浏览器路径；CI 上 Turnstile 可能失败)")
+                    if not has_solver:
+                        cli_log("[!] 未配置 CAPSOLVER/YESCAPTCHA/2CAPTCHA，浏览器 Turnstile 在 Actions 上大概率失败")
+                    profile = fill_profile_and_submit(
+                        log_callback=cli_log, cancel_callback=controller.should_stop
+                    )
+                    cli_log(f"[*] 资料已填: {profile.get('given_name')} {profile.get('family_name')}")
+                    cli_log("[*] 5. 等待 sso cookie")
+                    sso = wait_for_sso_cookie(
+                        log_callback=cli_log, cancel_callback=controller.should_stop
+                    )
                 if config.get("enable_nsfw", True):
                     cli_log("[*] 6. 开启 NSFW")
                     nsfw_ok, nsfw_msg = enable_nsfw_for_token(
