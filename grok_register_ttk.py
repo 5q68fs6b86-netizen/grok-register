@@ -735,8 +735,11 @@ def create_browser_options(browser_proxy=""):
         options.set_argument("--disable-dev-shm-usage")
         options.set_argument("--disable-gpu")
         options.set_argument("--window-size=1920,1080")
+        options.set_argument("--disable-blink-features=AutomationControlled")
         for bin_path in (
             "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/opt/google/chrome/chrome",
             "/usr/bin/chromium-browser",
             "/usr/bin/chromium",
             "/snap/bin/chromium",
@@ -744,6 +747,10 @@ def create_browser_options(browser_proxy=""):
             if os.path.exists(bin_path):
                 options.set_browser_path(bin_path)
                 break
+        # Avoid loading local turnstile extension in CI (often breaks headless)
+        # Extension is skipped intentionally under CI.
+        apply_browser_proxy_option(options, browser_proxy)
+        return options
     apply_browser_proxy_option(options, browser_proxy)
     if os.path.exists(EXTENSION_PATH):
         options.add_extension(EXTENSION_PATH)

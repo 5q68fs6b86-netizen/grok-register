@@ -20,19 +20,14 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Chromium + Xvfb
+      - name: Install Google Chrome
         run: |
           sudo apt-get update
-          sudo apt-get install -y chromium-browser fonts-liberation xvfb
-          for src in /usr/bin/chromium-browser /usr/bin/chromium /snap/bin/chromium; do
-            if [ -x "$src" ]; then
-              sudo ln -sfn "$src" /usr/bin/google-chrome || true
-              sudo ln -sfn "$src" /usr/bin/chrome || true
-              break
-            fi
-          done
-          which google-chrome || which chromium-browser || which chromium || true
-          google-chrome --version || chromium-browser --version || chromium --version || true
+          sudo apt-get install -y wget gnupg xvfb fonts-liberation
+          wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt-get install -y /tmp/chrome.deb || sudo apt-get -f install -y
+          google-chrome --version
+          which google-chrome
 
       - name: Install Python dependencies
         run: pip install -r requirements.txt
@@ -86,6 +81,24 @@ jobs:
         run: |
           Xvfb :99 -screen 0 1920x1080x24 &
           sleep 2
+          # Quick browser smoke test
+          python3 - <<'PY'
+          import os
+          from DrissionPage import Chromium, ChromiumOptions
+          options = ChromiumOptions()
+          options.auto_port()
+          options.headless(True)
+          options.set_argument("--no-sandbox")
+          options.set_argument("--disable-dev-shm-usage")
+          options.set_argument("--disable-gpu")
+          options.set_browser_path("/usr/bin/google-chrome")
+          browser = Chromium(options)
+          tab = browser.latest_tab
+          tab.get("https://example.com")
+          print("smoke title=", tab.title)
+          browser.quit(del_data=True)
+          print("browser smoke ok")
+          PY
           echo "start" | python grok_register_ttk.py cli
         timeout-minutes: 110
 
