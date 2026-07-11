@@ -1,0 +1,103 @@
+name: Register Grok Accounts
+
+on:
+  workflow_dispatch:
+    inputs:
+      count:
+        description: 'Number of accounts to register'
+        required: true
+        default: '1'
+
+jobs:
+  register:
+    timeout-minutes: 120
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Chromium
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y chromium-browser fonts-liberation
+          # Provide chrome binary alias for DrissionPage
+          if [ ! -e /usr/bin/google-chrome ] && [ -e /usr/bin/chromium-browser ]; then
+            sudo ln -sf /usr/bin/chromium-browser /usr/bin/google-chrome
+          fi
+          if [ ! -e /usr/bin/google-chrome ] && [ -e /usr/bin/chromium ]; then
+            sudo ln -sf /usr/bin/chromium /usr/bin/google-chrome
+          fi
+          which google-chrome || which chromium-browser || which chromium || true
+          google-chrome --version || chromium-browser --version || chromium --version || true
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate config.json from secrets
+        env:
+          CLOUDFLARE_API_BASE: ${{ secrets.CLOUDFLARE_API_BASE }}
+          CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
+          CLOUDFLARE_DOMAINS: ${{ secrets.CLOUDFLARE_DOMAINS }}
+          REGISTER_COUNT: ${{ github.event.inputs.count || '1' }}
+          GROK2API_REMOTE_BASE: ${{ secrets.GROK2API_REMOTE_BASE }}
+          GROK2API_REMOTE_APP_KEY: ${{ secrets.GROK2API_REMOTE_APP_KEY }}
+        run: |
+          python3 << 'PY'
+          import json, os
+          cfg = {
+            "email_provider": "cloudflare",
+            "cloudflare_api_base": os.environ["CLOUDFLARE_API_BASE"].rstrip("/"),
+            "cloudflare_api_key": os.environ["CLOUDFLARE_API_KEY"],
+            "cloudflare_auth_mode": "x-admin-auth",
+            "cloudflare_path_domains": "/api/domains",
+            "cloudflare_path_accounts": "/admin/new_address",
+            "cloudflare_path_token": "/api/token",
+            "cloudflare_path_messages": "/api/mails",
+            "defaultDomains": os.environ["CLOUDFLARE_DOMAINS"],
+            "proxy": "",
+            "enable_nsfw": True,
+            "register_count": int(os.environ.get("REGISTER_COUNT") or "1"),
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
+            "grok2api_auto_add_local": False,
+            "grok2api_local_token_file": "",
+            "grok2api_pool_name": "ssoBasic",
+            "grok2api_auto_add_remote": True,
+            "grok2api_remote_base": os.environ["GROK2API_REMOTE_BASE"].rstrip("/"),
+            "grok2api_remote_app_key": os.environ["GROK2API_REMOTE_APP_KEY"],
+          }
+          with open("config.json", "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+          print("config.json written")
+          print("provider=cloudflare")
+          print("api_base=", cfg["cloudflare_api_base"])
+          print("domains=", cfg["defaultDomains"])
+          print("count=", cfg["register_count"])
+          print("grok2api=", cfg["grok2api_remote_base"])
+          PY
+
+      - name: Run Grok Registration
+        env:
+          # Headless Chromium for CI
+          DISPLAY: ":99"
+        run: |
+          # Start virtual display for Chromium
+          sudo apt-get install -y xvfb
+          Xvfb :99 -screen 0 1920x1080x24 &
+          sleep 2
+          echo "start" | python grok_register_ttk.py cli
+        timeout-minutes: 110
+
+      - name: Upload account files
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: accounts
+          path: |
+            accounts_*.txt
+            mail_credentials.txt
+          if-no-files-found: warn
+          retention-days: 7
