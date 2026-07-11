@@ -751,6 +751,21 @@ def create_browser_options(browser_proxy=""):
         options.set_argument("--disable-infobars")
         options.set_argument("--no-first-run")
         options.set_argument("--no-default-browser-check")
+        options.set_argument("--disable-features=IsolateOrigins,site-per-process")
+        try:
+            options.set_pref("credentials_enable_service", False)
+        except Exception:
+            pass
+        # exclude switches if supported
+        try:
+            options.set_argument("--excludeSwitches=enable-automation")
+        except Exception:
+            pass
+        try:
+            options.set_argument("--disable-extensions-except=" + EXTENSION_PATH)
+            options.set_argument("--load-extension=" + EXTENSION_PATH)
+        except Exception:
+            pass
         ua = get_user_agent()
         if ua:
             try:
@@ -2480,114 +2495,162 @@ def getTurnstileToken(log_callback=None, cancel_callback=None):
     if page is None:
         raise Exception("页面未就绪，无法执行 Turnstile")
 
-    # Soft reset only once; repeated reset can prevent token settle
-    try:
-        page.run_js(
-            "try { if (window.turnstile && typeof turnstile.reset === 'function') turnstile.reset(); } catch(e) {}"
-        )
-    except Exception:
-        pass
-
-    # Simulate human activity before interacting with Turnstile
-    try:
-        page.run_js(
-            """
-try {
-  const sx = 800 + Math.floor(Math.random()*400);
-  const sy = 400 + Math.floor(Math.random()*300);
-  Object.defineProperty(MouseEvent.prototype, 'screenX', { get: () => sx, configurable: true });
-  Object.defineProperty(MouseEvent.prototype, 'screenY', { get: () => sy, configurable: true });
-  window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: sx/2, clientY: sy/2 }));
-  document.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: sx/2+10, clientY: sy/2+8 }));
-} catch(e) {}
-            """
-        )
-        page.actions.move_to(x=420, y=360).move(30, 20)
-    except Exception:
-        pass
-
-    for attempt in range(0, 35):
-        raise_if_cancelled(cancel_callback)
+    def _read_token():
         try:
             token = page.run_js(
                 """
 try {
+  if (window.__tp_token && String(window.__tp_token).length >= 80) return String(window.__tp_token);
   const byInput = String((document.querySelector('input[name="cf-turnstile-response"]') || {}).value || '').trim();
   if (byInput) return byInput;
-  const inputs = Array.from(document.querySelectorAll('input[name*="turnstile" i], textarea[name*="turnstile" i], input[name="cf-turnstile-response"]'));
+  const inputs = Array.from(document.querySelectorAll('input[name*="turnstile" i], textarea[name*="turnstile" i]'));
   for (const el of inputs) {
     const v = String(el.value || '').trim();
     if (v.length >= 80) return v;
   }
   if (window.turnstile && typeof turnstile.getResponse === 'function') {
-    return String(turnstile.getResponse() || '').trim();
+    const r = String(turnstile.getResponse() || '').trim();
+    if (r) return r;
   }
   return '';
 } catch(e) { return ''; }
                 """
             )
-            token = str(token or "").strip()
-            if len(token) >= 80:
-                if log_callback:
-                    log_callback(f"[*] Turnstile 已通过，token长度={len(token)}")
-                return token
+            return str(token or "").strip()
+        except Exception:
+            return ""
 
-            # Try multiple ways to click the Turnstile widget
-            if attempt % 3 == 0:
-                page.run_js(
-                    """
+    def _diag():
+        try:
+            info = page.run_js(
+                """
 try {
-  const frames = Array.from(document.querySelectorAll('iframe[src*="turnstile"], iframe[src*="challenges.cloudflare"]'));
-  for (const f of frames) {
-    try { f.scrollIntoView({block:'center'}); f.click(); } catch(e) {}
-  }
-  const boxes = Array.from(document.querySelectorAll('.cf-turnstile, [data-sitekey], div[id*="turnstile" i]'));
-  for (const b of boxes) {
-    try { b.scrollIntoView({block:'center'}); b.click(); } catch(e) {}
+  const frames = Array.from(document.querySelectorAll('iframe')).map(f => ({
+    src: f.src || '',
+    w: f.offsetWidth, h: f.offsetHeight
+  }));
+  const cf = document.querySelector('input[name="cf-turnstile-response"]');
+  const boxes = document.querySelectorAll('.cf-turnstile, [data-sitekey]').length;
+  return {
+    title: document.title,
+    url: location.href,
+    hasCfInput: !!cf,
+    cfLen: cf ? String(cf.value||'').length : 0,
+    boxes,
+    frames: frames.slice(0, 8),
+    sitekey: window.__tp_sitekey || (document.querySelector('[data-sitekey]')||{}).getAttribute?.('data-sitekey') || '',
+    webdriver: navigator.webdriver,
+  };
+} catch(e) { return {err: String(e)}; }
+                """
+            )
+            if log_callback:
+                log_callback(f"[Debug] Turnstile diag: {info}")
+        except Exception as exc:
+            if log_callback:
+                log_callback(f"[Debug] Turnstile diag failed: {exc}")
+
+    # Human-like pointer jitter
+    try:
+        page.run_js(
+            """
+try {
+  const sx = 900 + Math.floor(Math.random()*500);
+  const sy = 500 + Math.floor(Math.random()*400);
+  Object.defineProperty(MouseEvent.prototype, 'screenX', { get: () => sx, configurable: true });
+  Object.defineProperty(MouseEvent.prototype, 'screenY', { get: () => sy, configurable: true });
+  for (let i=0;i<5;i++) {
+    window.dispatchEvent(new MouseEvent('mousemove', {bubbles:true, clientX: 200+i*17, clientY: 180+i*11}));
   }
 } catch(e) {}
-                    """
-                )
+            """
+        )
+    except Exception:
+        pass
 
-            challenge_input = page.ele("@name=cf-turnstile-response", timeout=0.5)
+    # Soft reset once
+    try:
+        page.run_js("try { if (window.turnstile && turnstile.reset) turnstile.reset(); } catch(e) {}")
+    except Exception:
+        pass
+
+    for attempt in range(0, 40):
+        raise_if_cancelled(cancel_callback)
+        token = _read_token()
+        if len(token) >= 80:
+            if log_callback:
+                log_callback(f"[*] Turnstile 已通过，token长度={len(token)}")
+            return token
+
+        if attempt in (0, 5, 15, 25):
+            _diag()
+
+        # Locate turnstile iframe rect and click center via CDP-ish actions
+        try:
+            rect = page.run_js(
+                """
+try {
+  const f = document.querySelector('iframe[src*="challenges.cloudflare"], iframe[src*="turnstile"], iframe[title*="Widget"]');
+  if (!f) {
+    const box = document.querySelector('.cf-turnstile, [data-sitekey]');
+    if (!box) return null;
+    const r = box.getBoundingClientRect();
+    return {x: r.left + r.width/2, y: r.top + r.height/2, w: r.width, h: r.height, via:'box'};
+  }
+  const r = f.getBoundingClientRect();
+  return {x: r.left + Math.min(30, r.width/2), y: r.top + r.height/2, w: r.width, h: r.height, via:'iframe', src: f.src||''};
+} catch(e) { return null; }
+                """
+            )
+            if rect and isinstance(rect, dict) and rect.get("x") is not None:
+                x = float(rect["x"])
+                y = float(rect["y"])
+                if log_callback and attempt % 6 == 0:
+                    log_callback(f"[Debug] Turnstile click target={rect}")
+                try:
+                    # DrissionPage actions chain
+                    page.actions.move_to(x=int(x), y=int(y)).click()
+                except Exception:
+                    try:
+                        page.run_js(
+                            """
+const x = arguments[0], y = arguments[1];
+const el = document.elementFromPoint(x, y);
+if (el) {
+  el.dispatchEvent(new MouseEvent('mouseover', {bubbles:true, clientX:x, clientY:y}));
+  el.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, clientX:x, clientY:y}));
+  el.dispatchEvent(new MouseEvent('mouseup', {bubbles:true, clientX:x, clientY:y}));
+  el.dispatchEvent(new MouseEvent('click', {bubbles:true, clientX:x, clientY:y}));
+}
+                            """,
+                            x,
+                            y,
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Also try shadow-root path
+        try:
+            challenge_input = page.ele("@name=cf-turnstile-response", timeout=0.3)
             if challenge_input:
                 wrapper = challenge_input.parent()
                 iframe = None
                 try:
                     iframe = wrapper.shadow_root.ele("tag:iframe")
                 except Exception:
-                    iframe = None
-                if iframe is None:
-                    try:
-                        iframe = page.ele('tag:iframe@src:turnstile', timeout=0.5) or page.ele('tag:iframe@src:challenges.cloudflare', timeout=0.5)
-                    except Exception:
-                        iframe = None
+                    pass
                 if iframe:
                     try:
                         iframe.click()
                     except Exception:
                         pass
                     try:
-                        iframe.run_js(
-                            """
-window.dtp = 1;
-function getRandomInt(min, max) { return Math.floor(Math.random() * (max - min + 1)) + min; }
-let sx = getRandomInt(800, 1200);
-let sy = getRandomInt(400, 700);
-try {
-  Object.defineProperty(MouseEvent.prototype, 'screenX', { get: () => sx, configurable: true });
-  Object.defineProperty(MouseEvent.prototype, 'screenY', { get: () => sy, configurable: true });
-} catch(e) {}
-                            """
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        body = iframe.ele("tag:body", timeout=0.5)
+                        body = iframe.ele("tag:body", timeout=0.3)
                         if body:
                             try:
-                                body_sr = body.shadow_root
-                                btn = body_sr.ele("tag:input") or body_sr.ele("tag:label") or body_sr.ele("tag:span")
+                                btn = body.shadow_root.ele("tag:input") or body.shadow_root.ele("tag:label")
                                 if btn:
                                     btn.click()
                             except Exception:
@@ -2597,11 +2660,28 @@ try {
                                     pass
                     except Exception:
                         pass
-        except Exception as exc:
-            if log_callback and attempt % 8 == 0:
-                log_callback(f"[Debug] Turnstile 轮询异常: {exc}")
-        sleep_with_cancel(1.2, cancel_callback)
+        except Exception:
+            pass
 
+        # Execute turnstile if API available
+        if attempt in (8, 18, 28):
+            try:
+                page.run_js(
+                    """
+try {
+  if (window.turnstile && turnstile.execute) {
+    const el = document.querySelector('.cf-turnstile, [data-sitekey]');
+    if (el) turnstile.execute(el);
+  }
+} catch(e) {}
+                    """
+                )
+            except Exception:
+                pass
+
+        sleep_with_cancel(1.0, cancel_callback)
+
+    _diag()
     raise Exception("Turnstile 获取 token 失败")
 
 
