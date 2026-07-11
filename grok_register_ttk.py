@@ -2724,24 +2724,53 @@ def extract_turnstile_sitekey(log_callback=None):
         sitekey = page.run_js(
             r"""
 try {
+  function walk(node, out) {
+    if (!node) return;
+    if (node.nodeType === 1) {
+      const sk = node.getAttribute && node.getAttribute('data-sitekey');
+      if (sk) out.push(sk);
+      if (node.shadowRoot) walk(node.shadowRoot, out);
+      const children = node.children || [];
+      for (const c of children) walk(c, out);
+    }
+  }
+  const found = [];
+  walk(document.documentElement, found);
+  if (found.length) return found[0];
+
   const el = document.querySelector('[data-sitekey]');
   if (el) return el.getAttribute('data-sitekey') || '';
   const html = document.documentElement.innerHTML;
-  let m = html.match(/sitekey["'\s:=]+([0-9a-zA-Z_-]{20,})/);
-  if (m) return m[1];
-  m = html.match(/0x[0-9A-Za-z]{20,}/);
+  let m = html.match(/0x4[A-Za-z0-9_-]{20,}/);
   if (m) return m[0];
+  m = html.match(/sitekey["'\s:=]+([0-9A-Za-z_-]{20,})/i);
+  if (m) return m[1];
+  m = html.match(/"siteKey"\s*:\s*"([^"]+)"/i);
+  if (m) return m[1];
   for (const s of Array.from(document.scripts)) {
-    const t = s.textContent || '';
-    m = t.match(/sitekey["'\s:=]+([0-9a-zA-Z_-]{20,})/);
+    const t = s.textContent || s.src || '';
+    m = t.match(/0x4[A-Za-z0-9_-]{20,}/);
+    if (m) return m[0];
+    m = t.match(/sitekey["'\s:=]+([0-9A-Za-z_-]{20,})/i);
     if (m) return m[1];
   }
-  // iframe src
   for (const f of Array.from(document.querySelectorAll('iframe'))) {
     const src = f.src || '';
-    m = src.match(/[?&]sitekey=([^&]+)/);
+    m = src.match(/[?&]sitekey=([^&]+)/i);
     if (m) return decodeURIComponent(m[1]);
+    m = src.match(/0x4[A-Za-z0-9_-]{20,}/);
+    if (m) return m[0];
   }
+  // performance entries / resource urls
+  try {
+    for (const e of performance.getEntriesByType('resource')) {
+      const n = e.name || '';
+      m = n.match(/[?&]sitekey=([^&]+)/i);
+      if (m) return decodeURIComponent(m[1]);
+      m = n.match(/0x4[A-Za-z0-9_-]{20,}/);
+      if (m) return m[0];
+    }
+  } catch (e) {}
   return window.__tp_sitekey || '';
 } catch(e) { return ''; }
             """
@@ -3108,6 +3137,16 @@ return 'filled-no-submit';
                 if token_len == "0":
                     # Try to force-load widget once when empty
                     if wait_cf_since is None:
+                        try:
+                            html = page.html if page else ""
+                            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"debug_profile_{int(time.time())}.html")
+                            with open(path, "w", encoding="utf-8") as f:
+                                f.write(html or "")
+                            if log_callback:
+                                log_callback(f"[Debug] 已保存资料页 HTML: {path}")
+                        except Exception as _e:
+                            if log_callback:
+                                log_callback(f"[Debug] dump profile html failed: {_e}")
                         force_turnstile_widget_load(log_callback=log_callback)
                     pause_seconds = random.uniform(1, 3)
                     if log_callback:
