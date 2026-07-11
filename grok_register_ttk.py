@@ -1799,7 +1799,7 @@ def refresh_active_page():
     return page
 
 
-def click_email_signup_button(timeout=10, log_callback=None, cancel_callback=None):
+def click_email_signup_button(timeout=20, log_callback=None, cancel_callback=None):
     global page
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -1827,11 +1827,12 @@ function nodeText(node) {
 function scoreEntry(node) {
     const compact = nodeText(node).replace(/\s+/g, '');
     const lower = compact.toLowerCase();
-    if (compact.includes('使用邮箱注册')) return 100;
-    if (lower.includes('signupwithemail')) return 95;
-    if (lower.includes('continuewithemail')) return 90;
-    if (lower.includes('email') && (lower.includes('sign') || lower.includes('continue') || lower.includes('use') || lower.includes('with'))) return 80;
-    if (lower === 'email' || lower.includes('邮箱')) return 70;
+    if (compact.includes('使用邮箱注册') || compact.includes('使用邮箱')) return 100;
+    if (lower.includes('signupwithemail') || lower.includes('sign-up-with-email')) return 95;
+    if (lower.includes('continuewithemail') || lower.includes('continue-with-email')) return 90;
+    if (lower.includes('create account with email') || lower.includes('register with email')) return 88;
+    if (lower.includes('email') && (lower.includes('sign') || lower.includes('continue') || lower.includes('use') || lower.includes('with') || lower.includes('create') || lower.includes('register'))) return 80;
+    if (lower === 'email' || lower.includes('邮箱') || lower.includes('e-mail')) return 70;
     return 0;
 }
 const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]'))
@@ -1860,47 +1861,107 @@ return candidates[0].text || true;
 
         sleep_with_cancel(1, cancel_callback)
 
+    # Secondary: attribute / selector based click
+    try:
+        secondary = page.run_js(r"""
+const sels = [
+  'button[data-testid*="email" i]',
+  'a[data-testid*="email" i]',
+  'button[name*="email" i]',
+  'a[href*="email" i]',
+  'button[aria-label*="email" i]',
+  'a[aria-label*="email" i]',
+];
+for (const s of sels) {
+  try {
+    const el = document.querySelector(s);
+    if (el) { el.click(); return s; }
+  } catch (e) {}
+}
+// Try any visible button whose text-ish attributes mention email
+const all = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+for (const el of all) {
+  const t = ((el.innerText||'') + ' ' + (el.getAttribute('aria-label')||'') + ' ' + (el.getAttribute('data-testid')||'')).toLowerCase();
+  if (t.includes('email') || t.includes('邮箱')) {
+    const style = window.getComputedStyle(el);
+    if (style.display !== 'none' && style.visibility !== 'hidden') {
+      el.click();
+      return t.trim().slice(0,80);
+    }
+  }
+}
+return false;
+        """)
+        if secondary:
+            if log_callback:
+                log_callback(f"[*] 二次匹配点击邮箱注册: {secondary}")
+            sleep_with_cancel(2, cancel_callback)
+            return True
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Debug] 二次匹配失败: {exc}")
+
     if log_callback:
-        page_html = page.html[:500] if page else "no page"
+        try:
+            page_html = page.html[:800] if page else "no page"
+        except Exception:
+            page_html = "no page"
         log_callback(f"[Debug] 页面内容片段: {page_html}")
+        try:
+            log_callback(f"[Debug] 页面 title: {getattr(page, 'title', '')}")
+        except Exception:
+            pass
 
     raise Exception("未找到「使用邮箱注册」按钮")
 
 
 
 def page_looks_like_cloudflare_challenge(page_obj=None):
-    """Detect Cloudflare interstitial / attention pages."""
+    """Detect real Cloudflare interstitial / attention pages only.
+
+    Note: normal x.ai pages also load Cloudflare scripts, so do NOT treat
+    a bare "cloudflare" string in HTML as a block.
+    """
     target = page_obj or page
     if target is None:
         return False
     try:
         title = str(getattr(target, "title", "") or "")
-        url = str(getattr(target, "url", "") or "")
+        title_l = title.lower()
+        # Strong title signals
+        if "attention required" in title_l:
+            return True
+        if "just a moment" in title_l:
+            return True
+        if "cloudflare" in title_l and "grok" not in title_l and "sign" not in title_l:
+            return True
+
         html = ""
         try:
-            html = str(target.html or "")[:4000]
+            html = str(target.html or "")[:6000]
         except Exception:
             try:
-                html = str(target.run_js("return document.documentElement.outerHTML") or "")[:4000]
+                html = str(target.run_js("return document.documentElement.outerHTML") or "")[:6000]
             except Exception:
                 html = ""
-        blob = f"{title}\n{url}\n{html}".lower()
-        markers = (
-            "attention required",
-            "just a moment",
+        html_l = html.lower()
+        # Explicit challenge DOM / copy
+        hard_markers = (
+            "attention required! | cloudflare",
             "cf-browser-verification",
-            "cf-challenge",
-            "checking your browser",
-            "enable javascript and cookies",
-            "cdn-cgi/challenge",
-            "cloudflare",
+            "cf-challenge-running",
+            "cf-challenge-form",
+            "checking your browser before accessing",
+            "enable javascript and cookies to continue",
+            "cdn-cgi/challenge-platform",
+            "why have i been blocked",
         )
-        # title alone is strong signal
-        if "attention required" in title.lower() or "just a moment" in title.lower():
+        if any(m in html_l for m in hard_markers):
             return True
-        if "cloudflare" in title.lower() and "sign" not in title.lower():
-            return True
-        return any(m in blob for m in markers) and ("sign-up" in url or "accounts.x.ai" in url or "challenge" in blob)
+        # If page still has the real signup UI, it is not a block page
+        if ("使用邮箱" in html) or ("sign up with email" in html_l) or ("continue with email" in html_l) or ("data-testid" in html_l and "email" in html_l):
+            return False
+        return False
     except Exception:
         return False
 
@@ -2147,11 +2208,12 @@ function nodeText(node) {
 function scoreEntry(node) {
     const compact = nodeText(node).replace(/\s+/g, '');
     const lower = compact.toLowerCase();
-    if (compact.includes('使用邮箱注册')) return 100;
-    if (lower.includes('signupwithemail')) return 95;
-    if (lower.includes('continuewithemail')) return 90;
-    if (lower.includes('email') && (lower.includes('sign') || lower.includes('continue') || lower.includes('use') || lower.includes('with'))) return 80;
-    if (lower === 'email' || lower.includes('邮箱')) return 70;
+    if (compact.includes('使用邮箱注册') || compact.includes('使用邮箱')) return 100;
+    if (lower.includes('signupwithemail') || lower.includes('sign-up-with-email')) return 95;
+    if (lower.includes('continuewithemail') || lower.includes('continue-with-email')) return 90;
+    if (lower.includes('create account with email') || lower.includes('register with email')) return 88;
+    if (lower.includes('email') && (lower.includes('sign') || lower.includes('continue') || lower.includes('use') || lower.includes('with') || lower.includes('create') || lower.includes('register'))) return 80;
+    if (lower === 'email' || lower.includes('邮箱') || lower.includes('e-mail')) return 70;
     return 0;
 }
 const candidates = Array.from(document.querySelectorAll('button, a, [role="button"]'))
