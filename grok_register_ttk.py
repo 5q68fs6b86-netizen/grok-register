@@ -710,18 +710,25 @@ def add_token_to_grok2api_pools(raw_token, email="", log_callback=None):
 def apply_browser_proxy_option(options, proxy):
     if not proxy:
         return
+    raw = str(proxy or "").strip()
+    # Chromium expects socks5://host:port or host:port for HTTP
+    # Keep scheme for socks5/socks5h
+    chrome_proxy = raw
+    lower = raw.lower()
+    if lower.startswith("socks5h://"):
+        chrome_proxy = "socks5://" + raw.split("://", 1)[1]
     if hasattr(options, "set_proxy"):
         try:
-            options.set_proxy(proxy)
+            options.set_proxy(chrome_proxy)
             return
         except Exception:
             pass
     if not hasattr(options, "set_argument"):
         raise AttributeError("当前 DrissionPage ChromiumOptions 不支持设置浏览器代理")
     try:
-        options.set_argument(f"--proxy-server={proxy}")
+        options.set_argument(f"--proxy-server={chrome_proxy}")
     except TypeError:
-        options.set_argument("--proxy-server", proxy)
+        options.set_argument("--proxy-server", chrome_proxy)
 
 
 def create_browser_options(browser_proxy=""):
