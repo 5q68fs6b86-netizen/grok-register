@@ -727,21 +727,36 @@ def apply_browser_proxy_option(options, proxy):
 def create_browser_options(browser_proxy=""):
     options = ChromiumOptions()
     options.set_timeouts(base=1)
-    # CI / headless-friendly (GitHub Actions, Docker, etc.)
-    if os.environ.get("CI") or os.environ.get("GROK_HEADLESS") == "1":
-        # Explicit host:port avoids DrissionPage unpack error when address is incomplete
+    # CI / container friendly (GitHub Actions, Docker, etc.)
+    if os.environ.get("CI") or os.environ.get("GROK_HEADLESS") in ("0", "1", "true", "false"):
         import socket
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.bind(("127.0.0.1", 0))
             free_port = s.getsockname()[1]
         options.set_local_port(free_port)
-        options.headless(True)
+        # Prefer headed mode under Xvfb — Cloudflare challenges fail hard in pure headless
+        use_headless = os.environ.get("GROK_HEADLESS", "0") in ("1", "true", "yes")
+        if use_headless:
+            options.headless(True)
+            options.set_argument("--disable-gpu")
+        else:
+            options.headless(False)
+            options.set_argument("--start-maximized")
         options.set_argument("--no-sandbox")
         options.set_argument("--disable-dev-shm-usage")
-        options.set_argument("--disable-gpu")
         options.set_argument("--window-size=1920,1080")
         options.set_argument("--disable-blink-features=AutomationControlled")
         options.set_argument("--remote-allow-origins=*")
+        options.set_argument("--lang=en-US,en")
+        options.set_argument("--disable-infobars")
+        options.set_argument("--no-first-run")
+        options.set_argument("--no-default-browser-check")
+        ua = get_user_agent()
+        if ua:
+            try:
+                options.set_user_agent(ua)
+            except Exception:
+                options.set_argument(f"--user-agent={ua}")
         for bin_path in (
             "/usr/bin/google-chrome",
             "/usr/bin/google-chrome-stable",
@@ -754,8 +769,9 @@ def create_browser_options(browser_proxy=""):
             if os.path.exists(bin_path):
                 options.set_browser_path(bin_path)
                 break
-        # Skip turnstile extension under CI headless
         apply_browser_proxy_option(options, browser_proxy)
+        if os.path.exists(EXTENSION_PATH):
+            options.add_extension(EXTENSION_PATH)
         return options
     options.auto_port()
     apply_browser_proxy_option(options, browser_proxy)
@@ -1851,6 +1867,64 @@ return candidates[0].text || true;
     raise Exception("未找到「使用邮箱注册」按钮")
 
 
+
+def page_looks_like_cloudflare_challenge(page_obj=None):
+    """Detect Cloudflare interstitial / attention pages."""
+    target = page_obj or page
+    if target is None:
+        return False
+    try:
+        title = str(getattr(target, "title", "") or "")
+        url = str(getattr(target, "url", "") or "")
+        html = ""
+        try:
+            html = str(target.html or "")[:4000]
+        except Exception:
+            try:
+                html = str(target.run_js("return document.documentElement.outerHTML") or "")[:4000]
+            except Exception:
+                html = ""
+        blob = f"{title}\n{url}\n{html}".lower()
+        markers = (
+            "attention required",
+            "just a moment",
+            "cf-browser-verification",
+            "cf-challenge",
+            "checking your browser",
+            "enable javascript and cookies",
+            "cdn-cgi/challenge",
+            "cloudflare",
+        )
+        # title alone is strong signal
+        if "attention required" in title.lower() or "just a moment" in title.lower():
+            return True
+        if "cloudflare" in title.lower() and "sign" not in title.lower():
+            return True
+        return any(m in blob for m in markers) and ("sign-up" in url or "accounts.x.ai" in url or "challenge" in blob)
+    except Exception:
+        return False
+
+
+def wait_out_cloudflare_challenge(timeout=45, log_callback=None, cancel_callback=None):
+    """Poll until Cloudflare challenge leaves the page, or timeout."""
+    deadline = time.time() + timeout
+    saw = False
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        if not page_looks_like_cloudflare_challenge():
+            if saw and log_callback:
+                log_callback("[*] Cloudflare 挑战已通过")
+            return True
+        saw = True
+        if log_callback:
+            try:
+                log_callback(f"[Debug] 等待 Cloudflare 挑战通过... title={getattr(page, 'title', '')}")
+            except Exception:
+                log_callback("[Debug] 等待 Cloudflare 挑战通过...")
+        sleep_with_cancel(2, cancel_callback)
+    return not page_looks_like_cloudflare_challenge()
+
+
 def open_signup_page(log_callback=None, cancel_callback=None):
     global browser, page
     raise_if_cancelled(cancel_callback)
@@ -1890,6 +1964,31 @@ def open_signup_page(log_callback=None, cancel_callback=None):
     sleep_with_cancel(2, cancel_callback)
     if log_callback:
         log_callback(f"[*] 当前URL: {page.url}")
+    if page_looks_like_cloudflare_challenge():
+        if log_callback:
+            log_callback("[!] 检测到 Cloudflare 拦截页，尝试等待自动通过...")
+        ok = wait_out_cloudflare_challenge(
+            timeout=60, log_callback=log_callback, cancel_callback=cancel_callback
+        )
+        if not ok:
+            # one reload attempt
+            try:
+                page.refresh()
+                page.wait.doc_loaded()
+                sleep_with_cancel(3, cancel_callback)
+                wait_out_cloudflare_challenge(
+                    timeout=45, log_callback=log_callback, cancel_callback=cancel_callback
+                )
+            except Exception as exc:
+                if log_callback:
+                    log_callback(f"[Debug] 刷新挑战页失败: {exc}")
+        if page_looks_like_cloudflare_challenge():
+            raise Exception(
+                "注册页被 Cloudflare 拦截（Attention Required）。"
+                "GitHub Actions 数据中心 IP 通常会被拦，请配置可用的 PROXY 住宅代理后重试。"
+            )
+        if log_callback:
+            log_callback(f"[*] 挑战后 URL: {page.url}")
     click_email_signup_button(
         log_callback=log_callback, cancel_callback=cancel_callback
     )

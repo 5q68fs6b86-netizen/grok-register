@@ -27,7 +27,6 @@ jobs:
           wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
           sudo apt-get install -y /tmp/chrome.deb || sudo apt-get -f install -y
           google-chrome --version
-          which google-chrome
 
       - name: Install Python dependencies
         run: pip install -r requirements.txt
@@ -40,6 +39,7 @@ jobs:
           REGISTER_COUNT: ${{ github.event.inputs.count || '1' }}
           GROK2API_REMOTE_BASE: ${{ secrets.GROK2API_REMOTE_BASE }}
           GROK2API_REMOTE_APP_KEY: ${{ secrets.GROK2API_REMOTE_APP_KEY }}
+          PROXY: ${{ secrets.PROXY }}
         run: |
           python3 << 'PY'
           import json, os
@@ -53,7 +53,7 @@ jobs:
             "cloudflare_path_token": "/api/token",
             "cloudflare_path_messages": "/api/mails",
             "defaultDomains": os.environ["CLOUDFLARE_DOMAINS"],
-            "proxy": "",
+            "proxy": (os.environ.get("PROXY") or "").strip(),
             "enable_nsfw": True,
             "register_count": int(os.environ.get("REGISTER_COUNT") or "1"),
             "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
@@ -70,18 +70,19 @@ jobs:
           print("api_base=", cfg["cloudflare_api_base"])
           print("domains=", cfg["defaultDomains"])
           print("count=", cfg["register_count"])
+          print("proxy_set=", bool(cfg["proxy"]))
           print("grok2api=", cfg["grok2api_remote_base"])
           PY
 
       - name: Run Grok Registration
         env:
           CI: "true"
-          GROK_HEADLESS: "1"
+          # Use headed Chrome under Xvfb; pure headless is almost always CF-blocked
+          GROK_HEADLESS: "0"
           DISPLAY: ":99"
         run: |
           Xvfb :99 -screen 0 1920x1080x24 &
           sleep 2
-          # Quick browser smoke test
           python3 - <<'PY'
           import socket
           from DrissionPage import Chromium, ChromiumOptions
@@ -90,13 +91,12 @@ jobs:
               s.bind(("127.0.0.1", 0))
               port = s.getsockname()[1]
           options.set_local_port(port)
-          options.headless(True)
+          options.headless(False)
           options.set_argument("--no-sandbox")
           options.set_argument("--disable-dev-shm-usage")
-          options.set_argument("--disable-gpu")
           options.set_argument("--remote-allow-origins=*")
+          options.set_argument("--window-size=1920,1080")
           options.set_browser_path("/usr/bin/google-chrome")
-          print("smoke address=", getattr(options, "address", None), "browser_path=", getattr(options, "browser_path", None))
           browser = Chromium(options)
           tab = browser.latest_tab
           tab.get("https://example.com")
