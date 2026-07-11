@@ -20,17 +20,17 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Chromium
+      - name: Install Chromium + Xvfb
         run: |
           sudo apt-get update
-          sudo apt-get install -y chromium-browser fonts-liberation
-          # Provide chrome binary alias for DrissionPage
-          if [ ! -e /usr/bin/google-chrome ] && [ -e /usr/bin/chromium-browser ]; then
-            sudo ln -sf /usr/bin/chromium-browser /usr/bin/google-chrome
-          fi
-          if [ ! -e /usr/bin/google-chrome ] && [ -e /usr/bin/chromium ]; then
-            sudo ln -sf /usr/bin/chromium /usr/bin/google-chrome
-          fi
+          sudo apt-get install -y chromium-browser fonts-liberation xvfb
+          for src in /usr/bin/chromium-browser /usr/bin/chromium /snap/bin/chromium; do
+            if [ -x "$src" ]; then
+              sudo ln -sfn "$src" /usr/bin/google-chrome || true
+              sudo ln -sfn "$src" /usr/bin/chrome || true
+              break
+            fi
+          done
           which google-chrome || which chromium-browser || which chromium || true
           google-chrome --version || chromium-browser --version || chromium --version || true
 
@@ -72,7 +72,6 @@ jobs:
           with open("config.json", "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2, ensure_ascii=False)
           print("config.json written")
-          print("provider=cloudflare")
           print("api_base=", cfg["cloudflare_api_base"])
           print("domains=", cfg["defaultDomains"])
           print("count=", cfg["register_count"])
@@ -81,11 +80,10 @@ jobs:
 
       - name: Run Grok Registration
         env:
-          # Headless Chromium for CI
+          CI: "true"
+          GROK_HEADLESS: "1"
           DISPLAY: ":99"
         run: |
-          # Start virtual display for Chromium
-          sudo apt-get install -y xvfb
           Xvfb :99 -screen 0 1920x1080x24 &
           sleep 2
           echo "start" | python grok_register_ttk.py cli

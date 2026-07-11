@@ -728,6 +728,22 @@ def create_browser_options(browser_proxy=""):
     options = ChromiumOptions()
     options.auto_port()
     options.set_timeouts(base=1)
+    # CI / headless-friendly (GitHub Actions, Docker, etc.)
+    if os.environ.get("CI") or os.environ.get("GROK_HEADLESS") == "1":
+        options.headless(True)
+        options.set_argument("--no-sandbox")
+        options.set_argument("--disable-dev-shm-usage")
+        options.set_argument("--disable-gpu")
+        options.set_argument("--window-size=1920,1080")
+        for bin_path in (
+            "/usr/bin/google-chrome",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
+            "/snap/bin/chromium",
+        ):
+            if os.path.exists(bin_path):
+                options.set_browser_path(bin_path)
+                break
     apply_browser_proxy_option(options, browser_proxy)
     if os.path.exists(EXTENSION_PATH):
         options.add_extension(EXTENSION_PATH)
