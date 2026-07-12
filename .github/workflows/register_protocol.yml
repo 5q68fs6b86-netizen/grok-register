@@ -1,0 +1,212 @@
+name: Register Protocol Only
+
+on:
+  workflow_dispatch:
+    inputs:
+      count:
+        description: 'Number of accounts'
+        required: true
+        default: '1'
+
+jobs:
+  register:
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: |
+          pip install -U pip
+          pip install -r requirements.txt 2>/dev/null || true
+          pip install curl_cffi requests 2>/dev/null || true
+
+      - name: Generate config.json from secrets
+        env:
+          CLOUDFLARE_API_BASE: ${{ secrets.CLOUDFLARE_API_BASE }}
+          CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
+          CLOUDFLARE_DOMAINS: ${{ secrets.CLOUDFLARE_DOMAINS }}
+          REGISTER_COUNT: ${{ github.event.inputs.count || '1' }}
+          GROK2API_REMOTE_BASE: ${{ secrets.GROK2API_REMOTE_BASE }}
+          GROK2API_REMOTE_APP_KEY: ${{ secrets.GROK2API_REMOTE_APP_KEY }}
+          PROXY: ${{ secrets.PROXY }}
+          CAPSOLVER_API_KEY: ${{ secrets.CAPSOLVER_API_KEY }}
+          YESCAPTCHA_API_KEY: ${{ secrets.YESCAPTCHA_API_KEY }}
+          TWOCAPTCHA_API_KEY: ${{ secrets.TWOCAPTCHA_API_KEY }}
+        run: |
+          python3 << 'PY'
+          import json, os
+          proxy = (os.environ.get("PROXY") or "").strip()
+          
+          # Collect capsolver keys from env
+          cap = (os.environ.get("CAPSOLVER_API_KEY") or "").strip()
+          yes = (os.environ.get("YESCAPTCHA_API_KEY") or "").strip()
+          two = (os.environ.get("TWOCAPTCHA_API_KEY") or "").strip()
+          
+          cfg = {
+            "email_provider": "cloudflare",
+            "cloudflare_api_base": os.environ["CLOUDFLARE_API_BASE"].rstrip("/"),
+            "cloudflare_api_key": os.environ["CLOUDFLARE_API_KEY"],
+            "cloudflare_auth_mode": "x-admin-auth",
+            "cloudflare_path_domains": "/api/domains",
+            "cloudflare_path_accounts": "/admin/new_address",
+            "cloudflare_path_token": "/api/token",
+            "cloudflare_path_messages": "/api/mails",
+            "defaultDomains": os.environ["CLOUDFLARE_DOMAINS"],
+            "proxy": proxy,
+            "enable_nsfw": True,
+            "register_count": int(os.environ.get("REGISTER_COUNT") or "1"),
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "grok2api_auto_add_local": False,
+            "grok2api_pool_name": "ssoBasic",
+            "grok2api_auto_add_remote": True,
+            "grok2api_remote_base": os.environ["GROK2API_REMOTE_BASE"].rstrip("/"),
+            "grok2api_remote_app_key": os.environ["GROK2API_REMOTE_APP_KEY"],
+            "capsolver_api_key": cap,
+            "yescaptcha_api_key": yes,
+            "twocaptcha_api_key": two,
+          }
+          with open("config.json", "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+          print("count=", cfg["register_count"])
+          print("capsolver=", bool(cap), "yescaptcha=", bool(yes), "2captcha=", bool(two))
+          PY
+
+      - name: Run Protocol Registration
+        run: |
+          python3 << 'PY'
+          import json, os, sys, time, re, random
+          sys.path.insert(0, ".")
+          
+          # Browser-based email + code, then protocol signup
+          from grok_register_ttk import (start_browser, open_signup_page, fill_email_and_submit,
+                                          fill_code_and_submit, cli_log,
+                                          add_token_to_grok2api_pools, load_config)
+          from protocol_register import register_protocol, solve_turnstile_token
+          
+          load_config()
+          count = int((getattr(__import__("grok_register_ttk"), "config", {}) or {}).get("register_count", 1) or 1)
+          
+          with open("config.json") as f:
+              config = json.load(f)
+          
+          # Try to connect to x.ai from CI
+          import requests as req
+          try:
+              r = req.get("https://accounts.x.ai/sign-up?redirect=grok-com", timeout=30)
+              print(f"[*] x.ai reachable: HTTP {r.status_code}")
+          except Exception as e:
+              print(f"[!] x.ai unreachable: {e}")
+          
+          accounts_file = f"accounts_{int(time.time())}.txt"
+          
+          for i in range(count):
+              print(f"\n=== Account {i+1}/{count} ===")
+              try:
+                  # Get email via cloudflare API
+                  api_base = config.get("cloudflare_api_base", "").rstrip("/")
+                  api_key = config.get("cloudflare_api_key", "")
+                  domain = config.get("defaultDomains", "114514heihei.eu.org")
+                  
+                  import requests
+                  headers = {"x-admin-auth": api_key, "Content-Type": "application/json"}
+                  name = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz', k=10))
+                  r = requests.post(f"{api_base}/admin/new_address",
+                                    json={"name": name, "enablePrefix": True, "domain": domain},
+                                    headers=headers, timeout=30)
+                  data = r.json()
+                  email = data.get("address", "")
+                  jwt = data.get("jwt", "")
+                  print(f"[*] Email: {email}")
+                  print(f"[*] JWT: {jwt[:30]}...")
+                  
+                  # Wait for verification code
+                  print("[*] Waiting for verification code...")
+                  code = ""
+                  deadline = time.time() + 180
+                  seen = set()
+                  while time.time() < deadline:
+                      try:
+                          mr = requests.get(f"{api_base}/api/mails?limit=10&offset=0",
+                                            headers={"Authorization": f"Bearer {jwt}"}, timeout=15)
+                          mails = mr.json()
+                          msgs = mails.get("results", mails.get("messages", mails.get("data", []))) if isinstance(mails, dict) else mails
+                          if isinstance(msgs, dict) and "results" in msgs:
+                              msgs = msgs["results"]
+                          if not isinstance(msgs, list):
+                              msgs = []
+                          for msg in msgs:
+                              mid = msg.get("id") or msg.get("msgid") or ""
+                              if mid in seen: continue
+                              seen.add(mid)
+                              subj = str(msg.get("subject", "") or "")
+                              text = str(msg.get("text", "") or "") + str(msg.get("raw", "") or "") + str(msg.get("content", "") or "")
+                              html = msg.get("html") or ""
+                              if isinstance(html, list): html = "\n".join(html)
+                              combined = text + re.sub(r"<[^>]+>", " ", str(html))
+                              # Extract code: AAA-BBB format
+                              m = re.search(r'\b([A-Z0-9]{3}-[A-Z0-9]{3})\b', combined)
+                              if m:
+                                  code = m.group(1)
+                                  print(f"[+] Code: {code}")
+                                  break
+                          if code: break
+                      except Exception as e:
+                          print(f"  mail poll: {e}")
+                      time.sleep(3)
+                  
+                  if not code:
+                      raise Exception("No verification code received")
+                  
+                  # Try protocol registration
+                  print("[*] Attempting protocol registration...")
+                  try:
+                      result = register_protocol(email, code, config, log_fn=print)
+                      sso = result.get("sso", "")
+                      password = result.get("password", "")
+                      print(f"[+] SSO: {sso[:30]}...")
+                      print(f"[+] Password: {password}")
+                  except Exception as pe:
+                      print(f"[!] Protocol registration failed: {pe}")
+                      raise
+                  
+                  # Save account
+                  line = f"{email}----{password}----{sso}\n"
+                  with open(accounts_file, "a") as f:
+                      f.write(line)
+                  print(f"[+] Saved to {accounts_file}")
+                  
+                  # Add to grok2api
+                  try:
+                      # Re-use the helper from grok_register_ttk
+                      from grok_register_ttk import add_token_to_grok2api_pools
+                      add_token_to_grok2api_pools(sso, email=email, log_callback=print)
+                  except Exception as ge:
+                      print(f"[!] grok2api add failed: {ge}")
+                  
+              except Exception as exc:
+                  print(f"[-] Account {i+1} failed: {exc}")
+                  continue
+          
+          # List output
+          print("\n=== Outputs ===")
+          import glob
+          for f in glob.glob("accounts_*.txt") + glob.glob("*.txt"):
+              if os.path.exists(f):
+                  print(f, os.path.getsize(f))
+                  print(open(f).read()[:500])
+          PY
+
+      - name: Upload account files
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: accounts
+          path: accounts_*.txt
+          if-no-files-found: warn
+          retention-days: 7
