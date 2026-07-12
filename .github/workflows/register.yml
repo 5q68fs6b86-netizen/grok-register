@@ -4,12 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       count:
-        description: 'Number of accounts to register'
+        description: 'Number of accounts'
         required: true
-        default: '1'
-      use_warp:
-        description: 'Use Cloudflare WARP (1/0)'
-        required: false
         default: '1'
 
 jobs:
@@ -24,7 +20,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Google Chrome
+      - name: Install Google Chrome + Xvfb
         run: |
           sudo apt-get update
           sudo apt-get install -y wget gnupg xvfb fonts-liberation curl lsb-release
@@ -32,16 +28,15 @@ jobs:
           sudo apt-get install -y /tmp/chrome.deb || sudo apt-get -f install -y
           google-chrome --version
 
-      - name: Install and connect Cloudflare WARP (full tunnel)
-        if: ${{ github.event.inputs.use_warp != '0' }}
+      - name: Install Cloudflare WARP (full tunnel)
         run: |
           set -e
           curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
           echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
           sudo apt-get update
           sudo apt-get install -y cloudflare-warp
-          sudo systemctl enable --now warp-svc.service
-          sudo systemctl restart warp-svc.service
+          sudo systemctl enable --now warp-svc.service || true
+          sudo systemctl restart warp-svc.service || true
           sleep 4
           warp-cli --accept-tos registration new
           warp-cli --accept-tos mode warp
@@ -52,15 +47,13 @@ jobs:
             echo "$st" | grep -qi Connected && break
             sleep 2
           done
-          echo "Egress IPv4: $(curl -4 -s --max-time 15 https://ifconfig.me || true)"
+          echo "IPv4: $(curl -4 -s --max-time 15 https://ifconfig.me || true)"
           warp-cli --accept-tos status || true
 
-      - name: Install Python dependencies
-        run: |
-          pip install -U pip
-          pip install -r requirements.txt
+      - name: Install Python deps
+        run: pip install -r requirements.txt
 
-      - name: Generate config.json from secrets
+      - name: Generate config.json
         env:
           CLOUDFLARE_API_BASE: ${{ secrets.CLOUDFLARE_API_BASE }}
           CLOUDFLARE_API_KEY: ${{ secrets.CLOUDFLARE_API_KEY }}
@@ -68,11 +61,9 @@ jobs:
           REGISTER_COUNT: ${{ github.event.inputs.count || '1' }}
           GROK2API_REMOTE_BASE: ${{ secrets.GROK2API_REMOTE_BASE }}
           GROK2API_REMOTE_APP_KEY: ${{ secrets.GROK2API_REMOTE_APP_KEY }}
-          PROXY: ${{ secrets.PROXY }}
         run: |
-          python3 << 'PY'
+          python3 << 'CFG'
           import json, os
-          proxy = (os.environ.get("PROXY") or "").strip()
           cfg = {
             "email_provider": "cloudflare",
             "cloudflare_api_base": os.environ["CLOUDFLARE_API_BASE"].rstrip("/"),
@@ -83,41 +74,32 @@ jobs:
             "cloudflare_path_token": "/api/token",
             "cloudflare_path_messages": "/api/mails",
             "defaultDomains": os.environ["CLOUDFLARE_DOMAINS"],
-            "proxy": proxy,
+            "proxy": "",
             "enable_nsfw": True,
             "register_count": int(os.environ.get("REGISTER_COUNT") or "1"),
             "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
             "grok2api_auto_add_local": False,
-            "grok2api_local_token_file": "",
             "grok2api_pool_name": "ssoBasic",
             "grok2api_auto_add_remote": True,
             "grok2api_remote_base": os.environ["GROK2API_REMOTE_BASE"].rstrip("/"),
             "grok2api_remote_app_key": os.environ["GROK2API_REMOTE_APP_KEY"],
           }
-          with open("config.json", "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2, ensure_ascii=False)
-          print("config.json written")
-          print("count=", cfg["register_count"], "proxy=", cfg["proxy"] or "<system/WARP>")
-          PY
+          with open("config.json","w") as f: json.dump(cfg,f,indent=2)
+          print("count=", cfg["register_count"])
+          CFG
 
       - name: Run Grok Registration
         env:
           CI: "true"
-          GROK_HEADLESS: "0"
+          GROK_HEADLESS: "1"
           DISPLAY: ":99"
         run: |
           Xvfb :99 -screen 0 1920x1080x24 &
           sleep 2
-          echo "Runtime IP: $(curl -4 -s --max-time 10 https://ifconfig.me || true)"
-          set +e
           echo "start" | python grok_register_ttk.py cli
-          code=$?
-          set -e
-          ls -la accounts_*.txt mail_credentials.txt debug_* cpa_auths/ 2>/dev/null || true
-          exit $code
         timeout-minutes: 110
 
-      - name: Upload account files
+      - name: Upload accounts
         uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -126,6 +108,5 @@ jobs:
             accounts_*.txt
             mail_credentials.txt
             debug_*
-            cpa_auths/
           if-no-files-found: warn
           retention-days: 7
