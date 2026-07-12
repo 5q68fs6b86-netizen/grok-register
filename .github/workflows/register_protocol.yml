@@ -39,15 +39,12 @@ jobs:
           YESCAPTCHA_API_KEY: ${{ secrets.YESCAPTCHA_API_KEY }}
           TWOCAPTCHA_API_KEY: ${{ secrets.TWOCAPTCHA_API_KEY }}
         run: |
-          python3 << 'PY'
+          python3 << 'INNER'
           import json, os
           proxy = (os.environ.get("PROXY") or "").strip()
-          
-          # Collect capsolver keys from env
           cap = (os.environ.get("CAPSOLVER_API_KEY") or "").strip()
           yes = (os.environ.get("YESCAPTCHA_API_KEY") or "").strip()
           two = (os.environ.get("TWOCAPTCHA_API_KEY") or "").strip()
-          
           cfg = {
             "email_provider": "cloudflare",
             "cloudflare_api_base": os.environ["CLOUDFLARE_API_BASE"].rstrip("/"),
@@ -75,132 +72,149 @@ jobs:
             json.dump(cfg, f, indent=2, ensure_ascii=False)
           print("count=", cfg["register_count"])
           print("capsolver=", bool(cap), "yescaptcha=", bool(yes), "2captcha=", bool(two))
-          PY
+          INNER
 
       - name: Run Protocol Registration
         run: |
-          python3 << 'PY'
-          import json, os, sys, time, re, random
+          python3 << 'SIGNUP'
+          import json, os, sys, time, re, random, requests as http_req
           sys.path.insert(0, ".")
-          
-          # Browser-based email + code, then protocol signup
-          from grok_register_ttk import (start_browser, open_signup_page, fill_email_and_submit,
-                                          fill_code_and_submit, cli_log,
-                                          add_token_to_grok2api_pools, load_config)
-          from protocol_register import register_protocol, solve_turnstile_token
-          
-          load_config()
-          count = int((getattr(__import__("grok_register_ttk"), "config", {}) or {}).get("register_count", 1) or 1)
           
           with open("config.json") as f:
               config = json.load(f)
           
-          # Try to connect to x.ai from CI
-          import requests as req
-          try:
-              r = req.get("https://accounts.x.ai/sign-up?redirect=grok-com", timeout=30)
-              print(f"[*] x.ai reachable: HTTP {r.status_code}")
-          except Exception as e:
-              print(f"[!] x.ai unreachable: {e}")
-          
+          api_base = config.get("cloudflare_api_base", "").rstrip("/")
+          api_key = config.get("cloudflare_api_key", "")
+          domain = config.get("defaultDomains", "114514heihei.eu.org")
+          count = int(config.get("register_count", 1) or 1)
           accounts_file = f"accounts_{int(time.time())}.txt"
           
+          def log(m):
+              print(m, flush=True)
+          
           for i in range(count):
-              print(f"\n=== Account {i+1}/{count} ===")
+              log(f"\n=== Account {i+1}/{count} ===")
               try:
-                  # Get email via cloudflare API
-                  api_base = config.get("cloudflare_api_base", "").rstrip("/")
-                  api_key = config.get("cloudflare_api_key", "")
-                  domain = config.get("defaultDomains", "114514heihei.eu.org")
-                  
-                  import requests
-                  headers = {"x-admin-auth": api_key, "Content-Type": "application/json"}
+                  # Step 1: Create temp email
                   name = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz', k=10))
-                  r = requests.post(f"{api_base}/admin/new_address",
-                                    json={"name": name, "enablePrefix": True, "domain": domain},
-                                    headers=headers, timeout=30)
+                  r = http_req.post(f"{api_base}/admin/new_address",
+                      json={"name": name, "enablePrefix": True, "domain": domain},
+                      headers={"x-admin-auth": api_key, "Content-Type": "application/json"}, timeout=30)
+                  if r.status_code != 200:
+                      raise Exception(f"Email creation failed: {r.status_code} {r.text[:200]}")
                   data = r.json()
                   email = data.get("address", "")
                   jwt = data.get("jwt", "")
-                  print(f"[*] Email: {email}")
-                  print(f"[*] JWT: {jwt[:30]}...")
+                  log(f"Email: {email}")
                   
-                  # Wait for verification code
-                  print("[*] Waiting for verification code...")
+                  # Step 2: Send signup code via gRPC-web
+                  log("Sending OTP via protocol...")
+                  try:
+                      from protocol_register import register_protocol
+                      # Separate OTP send
+                      import struct as _st
+                      def _varint(n):
+                          b = []
+                          while True:
+                              by = n & 0x7F
+                              n >>= 7
+                              if n: b.append(by | 0x80)
+                              else: b.append(by); break
+                          return bytes(b)
+                      def _pb(f, v):
+                          enc = v.encode()
+                          tag = (f << 3) | 2
+                          return _varint(tag) + _varint(len(enc)) + enc
+                      def _grpc(body):
+                          return b'\x00' + _st.pack('>I', len(body)) + body
+                      
+                      from curl_cffi import requests as cffi
+                      s = cffi.Session(impersonate="chrome131")
+                      body = _pb(1, email)
+                      r = s.post("https://accounts.x.ai/auth_mgmt.AuthManagement/CreateEmailValidationCode",
+                          headers={"content-type": "application/grpc-web+proto", "x-grpc-web": "1"},
+                          data=_grpc(body), timeout=60)
+                      log(f"OTP sent: status={r.status_code}")
+                  except Exception as e:
+                      log(f"OTP send (non-fatal): {e}")
+                  
+                  # Step 3: Wait for verification code
+                  log("Polling for verification code...")
                   code = ""
                   deadline = time.time() + 180
                   seen = set()
                   while time.time() < deadline:
                       try:
-                          mr = requests.get(f"{api_base}/api/mails?limit=10&offset=0",
-                                            headers={"Authorization": f"Bearer {jwt}"}, timeout=15)
+                          mr = http_req.get(f"{api_base}/api/mails?limit=10&offset=0",
+                              headers={"Authorization": f"Bearer {jwt}"}, timeout=15)
                           mails = mr.json()
-                          msgs = mails.get("results", mails.get("messages", mails.get("data", []))) if isinstance(mails, dict) else mails
-                          if isinstance(msgs, dict) and "results" in msgs:
-                              msgs = msgs["results"]
-                          if not isinstance(msgs, list):
-                              msgs = []
+                          msgs = mails if isinstance(mails, list) else []
+                          for k in ['results', 'messages', 'data']:
+                              if isinstance(mails, dict) and k in mails:
+                                  v = mails[k]
+                                  msgs = v if isinstance(v, list) else []
+                                  break
                           for msg in msgs:
-                              mid = msg.get("id") or msg.get("msgid") or ""
+                              mid = str(msg.get("id") or msg.get("msgid") or "")
                               if mid in seen: continue
                               seen.add(mid)
-                              subj = str(msg.get("subject", "") or "")
-                              text = str(msg.get("text", "") or "") + str(msg.get("raw", "") or "") + str(msg.get("content", "") or "")
-                              html = msg.get("html") or ""
-                              if isinstance(html, list): html = "\n".join(html)
-                              combined = text + re.sub(r"<[^>]+>", " ", str(html))
-                              # Extract code: AAA-BBB format
+                              combined = ""
+                              for field in ("text","raw","content","body","snippet"):
+                                  v = msg.get(field)
+                                  if isinstance(v, str): combined += v + "\n"
+                              html = msg.get("html") or []
+                              if isinstance(html, str): html = [html]
+                              for h in html: combined += re.sub(r"<[^>]+>"," ",h) + "\n"
+                              subj = str(msg.get("subject","") or "")
                               m = re.search(r'\b([A-Z0-9]{3}-[A-Z0-9]{3})\b', combined)
                               if m:
                                   code = m.group(1)
-                                  print(f"[+] Code: {code}")
+                                  log(f"Code: {code}")
                                   break
                           if code: break
                       except Exception as e:
-                          print(f"  mail poll: {e}")
+                          log(f"  poll: {e}")
                       time.sleep(3)
                   
                   if not code:
-                      raise Exception("No verification code received")
+                      raise Exception("No verification code within 180s")
                   
-                  # Try protocol registration
-                  print("[*] Attempting protocol registration...")
-                  try:
-                      result = register_protocol(email, code, config, log_fn=print)
-                      sso = result.get("sso", "")
-                      password = result.get("password", "")
-                      print(f"[+] SSO: {sso[:30]}...")
-                      print(f"[+] Password: {password}")
-                  except Exception as pe:
-                      print(f"[!] Protocol registration failed: {pe}")
-                      raise
+                  # Step 4: Protocol registration
+                  log("Protocol registration...")
+                  result = register_protocol(email, code, config, log_fn=log)
+                  sso = result.get("sso", "")
+                  password = result.get("password","")
+                  log(f"SSO: {sso[:30]}...")
                   
-                  # Save account
+                  # Save
                   line = f"{email}----{password}----{sso}\n"
                   with open(accounts_file, "a") as f:
                       f.write(line)
-                  print(f"[+] Saved to {accounts_file}")
+                  log(f"Saved: {accounts_file}")
                   
-                  # Add to grok2api
+                  # Add to grok2api remote
                   try:
-                      # Re-use the helper from grok_register_ttk
-                      from grok_register_ttk import add_token_to_grok2api_pools
-                      add_token_to_grok2api_pools(sso, email=email, log_callback=print)
+                      from grok_register_ttk import add_token_to_grok2api_pools, load_config
+                      load_config()
+                      import grok_register_ttk as reg
+                      reg.add_token_to_grok2api_pools(sso, email=email, log_callback=log)
                   except Exception as ge:
-                      print(f"[!] grok2api add failed: {ge}")
+                      log(f"grok2api: {ge}")
                   
               except Exception as exc:
-                  print(f"[-] Account {i+1} failed: {exc}")
+                  log(f"FAILED: {exc}")
+                  import traceback
+                  traceback.print_exc()
                   continue
           
-          # List output
-          print("\n=== Outputs ===")
+          print("\n=== Output ===", flush=True)
           import glob
-          for f in glob.glob("accounts_*.txt") + glob.glob("*.txt"):
+          for f in glob.glob("accounts_*.txt"):
               if os.path.exists(f):
-                  print(f, os.path.getsize(f))
-                  print(open(f).read()[:500])
-          PY
+                  print(f, os.path.getsize(f), flush=True)
+                  with open(f) as fh:
+                      print(fh.read()[:500], flush=True)
+          SIGNUP
 
       - name: Upload account files
         uses: actions/upload-artifact@v4
